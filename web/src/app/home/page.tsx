@@ -28,7 +28,7 @@ import { AppHeader, AppShell, Banner, EmptyState, IconWell, PageHero, PillLink, 
 import { useSurakshaState } from "@/hooks/useSurakshaState";
 import { ApiError, api } from "@/lib/api";
 import type { SurakshaAlertView, SurakshaState, Escalation } from "@/lib/surakshaTypes";
-import type { Viewer } from "@/lib/amplify";
+import type { Viewer } from "@/lib/session";
 import { enablePush, pushStatus, type PushStatus } from "@/lib/push";
 import { cn } from "@/lib/utils";
 
@@ -52,11 +52,13 @@ interface Dashboard {
 const ALERT_TITLES: Record<string, string> = {
   no_wake: "Not up at her usual time",
   no_response: "Didn't answer Suraksha",
-  fall: "The watch thought she fell",
   parent_words: "Said she wasn't feeling well",
 };
 
-const alertTitle = (a: SurakshaAlertView) => ALERT_TITLES[a.kind] ?? a.kind.replace(/_/g, " ");
+const alertTitle = (a: SurakshaAlertView) => {
+  if (a.kind === "fall") return `The ${a.source === "phone" ? "phone" : "watch"} thought she fell`;
+  return ALERT_TITLES[a.kind] ?? a.kind.replace(/_/g, " ");
+};
 
 export default function HomePage() {
   return <AuthGate>{(viewer, signOut) => <FamilyHome viewer={viewer} signOut={signOut} />}</AuthGate>;

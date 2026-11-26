@@ -109,7 +109,7 @@ function Timeline() {
 
         <Reveal delay={0.1}>
           <section className="panel h-full p-6">
-            <SectionTitle eyebrow="Step Functions" title="Family coordination" />
+            <SectionTitle eyebrow="Escalation" title="Family coordination" />
             <div className="mt-4">
               {escalations.length === 0 ? (
                 <EmptyState icon={<People size={22} />}>No coordination yet.</EmptyState>

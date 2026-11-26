@@ -18,22 +18,22 @@ const TONE_CLS = {
 const LAYERS = [
   {
     name: "Orchestrator",
-    detail: "Strands · Bedrock Nova 2 Lite · tier policy in code",
+    detail: "Strands · Groq / Gemini LLM · tier policy in code",
     role: "Owns deviation + who may speak",
   },
   {
     name: "Companion Agent",
-    detail: "Hindi + English voice · Amazon Transcribe · Amazon Polly Kajal",
+    detail: "Hindi + English voice · Wispr Flow speech-to-text · Edge neural TTS",
     role: "The only agent Amma perceives",
   },
   {
     name: "Routine Model Agent",
-    detail: "DynamoDB · 13 simulated days + live today",
+    detail: "Postgres · 13 simulated days + live today",
     role: "What's normal for this person",
   },
   {
     name: "Watch Signal Agent",
-    detail: "Wear OS · first movement · I'm okay",
+    detail: "Wear OS watch or phone · first movement · I'm okay",
     role: "Quiet edge signals",
   },
   {
@@ -43,7 +43,7 @@ const LAYERS = [
   },
   {
     name: "Family Coordination Agent",
-    detail: "Rahul → Priya → Sunita aunty · Step Functions + Web Push",
+    detail: "Rahul → Priya → Sunita aunty · timed asks + Web Push",
     role: "The right person, calmly",
   },
 ];
@@ -61,7 +61,7 @@ export function Architecture() {
               </h2>
               <p className="mt-6 max-w-[42ch] text-[1rem] font-normal leading-[1.6] text-ink-soft">
                 Companion, Routine Model, Watch Signal, Investigation, and Family
-                Coordination run on Strands and Bedrock. Every tool call passes a Cedar
+                Coordination run on Strands with Groq and Gemini, served from Render. Every tool call passes a Cedar
                 consent check Amma sets by voice, and every decision is logged for her to read.
                 Family never gets a ping unless the orchestrator decides Tier 2.
               </p>

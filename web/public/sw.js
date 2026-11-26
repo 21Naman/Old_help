@@ -61,9 +61,9 @@ self.addEventListener("notificationclick", (event) => {
           // Accepted: they are on their way, so open what they need to know before they walk in.
         }
       }
-      const url = data.esc_id ? `/family/respond/${data.esc_id}` : data.type && data.audience === "parent" ? "/parent" : "/home";
+      const url = data.esc_id ? `/family/respond?id=${encodeURIComponent(data.esc_id)}` : data.type && data.audience === "parent" ? "/parent" : "/home";
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-      const existing = windows.find((w) => new URL(w.url).pathname === url);
+      const existing = windows.find((w) => { const u = new URL(w.url); return u.pathname + u.search === url; });
       if (existing) return existing.focus();
       return self.clients.openWindow(url);
     })(),

@@ -1,9 +1,13 @@
-"""Ally HTTP API (FastAPI). Runs under uvicorn locally and on Lambda via the Lambda Web Adapter."""
+"""Ally HTTP API (FastAPI). Runs under uvicorn, locally and on Render.
+
+Every route is served under both /ally and /suraksha (the web app uses the latter)."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,46 +15,71 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agents import family_qa, orchestrator
 from agents.schemas import HealthProbe
+import auth
 from auth import Identity, current_identity, require_family, require_parent, verify_device_key
 from config import (
-    AWS_REGION,
-    BEDROCK_FAILOVER_REGION,
-    BEDROCK_MODEL_ID,
     CORS_ORIGINS,
+    CRON_SECRET,
     DEV_TOOLS,
     FAMILY_ASK_DAILY_LIMIT,
     HOST,
-    POLLY_ENGINE,
-    POLLY_VOICE,
+    INPROC_SCHEDULER,
+    LLM_FALLBACK_MODEL,
+    LLM_MODEL,
+    PARENT_ID,
     PORT,
+    TTS_VOICE_EN,
+    TTS_VOICE_HI,
+    WISPR_API_KEY,
 )
 from core import clock
 from core.errors import AllyError, Conflict, Forbidden, LLMError
 from core.log import log
+from escalation import handoff, tokens
 from escalation import service as escalation
-from escalation import tokens
-from llm.bedrock import structured
+from llm.client import structured
 from notify import push
 from policy import consent
 from proactive import channel, reminders
 from store.repo import get_repo
 from voice import speech, stt
 
-app = FastAPI(title="Ally", version="2.0.0")
+SWEEP_EVERY_S = 60
+
+
+async def _sweep_forever() -> None:
+    while True:
+        await asyncio.sleep(SWEEP_EVERY_S)
+        try:
+            await orchestrator.sweep()
+        except Exception as exc:  # keep the loop alive; the next minute tries again
+            log("sweep_failed", error=repr(exc))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    task = asyncio.create_task(_sweep_forever()) if INPROC_SCHEDULER else None
+    yield
+    if task:
+        task.cancel()
+
+
+app = FastAPI(title="Ally", version="3.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["authorization", "content-type", "x-dev-member"],
+    allow_headers=["authorization", "content-type", "x-dev-member", "x-ally-device-key", "x-suraksha-device-key"],
 )
+api = APIRouter()
 
 GENTLE_ERROR = {
     "hi-IN": "माफ़ कीजिए, मुझे अभी थोड़ी दिक्कत हो रही है। कृपया थोड़ी देर में फिर कोशिश करें।",
@@ -75,6 +104,13 @@ class WatchIn(BaseModel):
     kind: Literal["wake", "first_movement", "activity", "im_okay", "fall"] = "activity"
     steps: int | None = Field(default=None, ge=0)
     heart_rate: int | None = Field(default=None, ge=20, le=250)
+    # Which device sent it. Older watch builds omit it.
+    source: Literal["watch", "phone"] = "watch"
+
+
+class LoginIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=200)
 
 
 class ParentTextIn(BaseModel):
@@ -135,29 +171,46 @@ async def health_deep() -> dict[str, Any]:
     )
     return {
         "ok": probe.ok,
-        "model": BEDROCK_MODEL_ID,
-        "region": AWS_REGION,
-        "failover_region": BEDROCK_FAILOVER_REGION,
-        "stt": "amazon-transcribe",
-        "tts": f"amazon-polly:{POLLY_VOICE}:{POLLY_ENGINE}",
+        "model": LLM_MODEL,
+        "fallback_model": LLM_FALLBACK_MODEL or None,
+        "stt": "wispr+groq-whisper" if WISPR_API_KEY else "groq-whisper",
+        "tts": f"edge-tts:{TTS_VOICE_HI},{TTS_VOICE_EN}",
         "time": clock.iso(clock.now()),
     }
+
+
+# ---- sign in & scheduler ----------------------------------------------------------------------
+
+
+@api.post("/auth/login")
+def login(body: LoginIn) -> dict[str, Any]:
+    return auth.login(body.username, body.password)
+
+
+@api.post("/cron/sweep")
+async def cron_sweep(x_cron_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    """Hit every minute by an external cron (also keeps a free-tier instance awake)."""
+    import hmac
+
+    if not CRON_SECRET or not x_cron_secret or not hmac.compare_digest(x_cron_secret, CRON_SECRET):
+        raise Forbidden("Unknown caller.")
+    return await orchestrator.sweep()
 
 
 # ---- shared state -----------------------------------------------------------------------------
 
 
-@app.get("/ally/state")
+@api.get("/state")
 def get_state(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     return orchestrator.snapshot(identity.parent_id, viewer="parent" if identity.is_parent else identity.member_id)
 
 
-@app.get("/ally/proactive/pending")
+@api.get("/proactive/pending")
 def pending_messages(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     return {"messages": channel.claim(identity.parent_id, identity.audience)}
 
 
-@app.post("/ally/proactive/{msg_id}/ack")
+@api.post("/proactive/{msg_id}/ack")
 def ack_message(msg_id: str, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     msg = get_repo().get_message(identity.parent_id, msg_id)
     if not msg or msg.get("audience") != identity.audience:
@@ -171,17 +224,17 @@ def ack_message(msg_id: str, identity: Identity = Depends(current_identity)) -> 
 # ---- push -------------------------------------------------------------------------------------
 
 
-@app.get("/ally/push/vapid-public-key")
+@api.get("/push/vapid-public-key")
 def vapid_key() -> dict[str, Any]:
     return {"key": push.vapid_public_key()}
 
 
-@app.post("/ally/push/subscribe")
+@api.post("/push/subscribe")
 def push_subscribe(body: PushSubIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     return {"ok": True, "id": push.subscribe(identity.parent_id, identity.audience, body.subscription)}
 
 
-@app.delete("/ally/push/subscribe")
+@api.delete("/push/subscribe")
 def push_unsubscribe(body: PushSubIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     push.unsubscribe(identity.parent_id, identity.audience, str(body.subscription.get("endpoint") or ""))
     return {"ok": True}
@@ -190,14 +243,14 @@ def push_unsubscribe(body: PushSubIn, identity: Identity = Depends(current_ident
 # ---- parent -----------------------------------------------------------------------------------
 
 
-@app.post("/ally/parent/text")
+@api.post("/parent/text")
 async def parent_text(body: ParentTextIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     result = await orchestrator.on_parent_turn(identity.parent_id, body.text.strip(), source="text")
     return {**result, "state": orchestrator.snapshot(identity.parent_id, viewer="parent")}
 
 
-@app.post("/ally/parent/audio")
+@api.post("/parent/audio")
 async def parent_audio(body: AudioIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     profile = get_repo().get_profile(identity.parent_id) or {}
@@ -228,27 +281,27 @@ async def parent_audio(body: AudioIn, identity: Identity = Depends(current_ident
     }
 
 
-@app.post("/ally/companion/start")
+@api.post("/companion/start")
 async def companion_start(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     result = await orchestrator.on_parent_turn(identity.parent_id, "", source="open")
     return {**result, "state": orchestrator.snapshot(identity.parent_id, viewer="parent")}
 
 
-@app.post("/ally/tts")
+@api.post("/tts")
 async def tts(body: TtsIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     return await speech.synthesize(body.text, body.language)
 
 
-@app.post("/ally/im-okay")
+@api.post("/im-okay")
 async def im_okay(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     result = await orchestrator.on_im_okay(identity.parent_id, source="tablet")
     return {**result, "state": orchestrator.snapshot(identity.parent_id, viewer="parent")}
 
 
-@app.get("/ally/parent/audit")
+@api.get("/parent/audit")
 def parent_audit(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     repo = get_repo()
@@ -267,7 +320,7 @@ def parent_audit(identity: Identity = Depends(current_identity)) -> dict[str, An
     }
 
 
-@app.get("/ally/parent/consent")
+@api.get("/parent/consent")
 def parent_consent(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     repo = get_repo()
@@ -277,7 +330,7 @@ def parent_consent(identity: Identity = Depends(current_identity)) -> dict[str, 
     }
 
 
-@app.post("/ally/parent/consent/{rule_id}/confirm")
+@api.post("/parent/consent/{rule_id}/confirm")
 def confirm_consent(rule_id: str, body: ConfirmIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     rule = consent.confirm_rule(identity.parent_id, rule_id, body.yes)
@@ -286,7 +339,7 @@ def confirm_consent(rule_id: str, body: ConfirmIn, identity: Identity = Depends(
     return {"rule": {k: v for k, v in rule.items() if k != "cedar"}}
 
 
-@app.delete("/ally/parent/consent/{rule_id}")
+@api.delete("/parent/consent/{rule_id}")
 def revoke_consent(rule_id: str, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     if not consent.revoke_rule(identity.parent_id, rule_id):
@@ -294,7 +347,7 @@ def revoke_consent(rule_id: str, identity: Identity = Depends(current_identity))
     return {"ok": True}
 
 
-@app.post("/ally/escalations/{esc_id}/neighbour")
+@api.post("/escalations/{esc_id}/neighbour")
 async def neighbour_reply(esc_id: str, body: NeighbourReplyIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_parent(identity)
     await escalation.reply(identity.parent_id, esc_id, responder="parent", decision=body.decision)
@@ -304,7 +357,7 @@ async def neighbour_reply(esc_id: str, body: NeighbourReplyIn, identity: Identit
 # ---- family -----------------------------------------------------------------------------------
 
 
-@app.get("/ally/dashboard")
+@api.get("/dashboard")
 def dashboard(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_family(identity)
     repo = get_repo()
@@ -342,7 +395,7 @@ def dashboard(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     }
 
 
-@app.get("/ally/alerts/{alert_id}")
+@api.get("/alerts/{alert_id}")
 def alert_detail(alert_id: str, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_family(identity)
     repo = get_repo()
@@ -361,14 +414,14 @@ def alert_detail(alert_id: str, identity: Identity = Depends(current_identity)) 
     return {
         "alert": alert,
         "baseline": profile.get("baseline"),
-        "escalation": {k: v for k, v in (esc or {}).items() if k != "task_token"} or None,
+        "escalation": {k: v for k, v in (esc or {}).items() if k != "machine"} or None,
         "consent_decisions": list(reversed(audit)),
         "parent_words": None if not words_ok else [],
         "parent_words_note": None if words_ok else f"{profile.get('name', 'Amma')} keeps her conversations private.",
     }
 
 
-@app.post("/ally/family/ask")
+@api.post("/family/ask")
 async def family_ask(body: AskIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_family(identity)
     repo = get_repo()
@@ -382,7 +435,7 @@ async def family_ask(body: AskIn, identity: Identity = Depends(current_identity)
     return {**result.model_dump(), "denied_tools": guard.denied_tools}
 
 
-@app.post("/ally/family/note")
+@api.post("/family/note")
 async def family_note(body: NoteIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_family(identity)
     repo = get_repo()
@@ -409,19 +462,25 @@ async def family_note(body: NoteIn, identity: Identity = Depends(current_identit
     return {"ok": True, "id": msg["id"]}
 
 
-@app.get("/ally/escalations/{esc_id}")
+@api.get("/escalations/{esc_id}")
 def get_escalation(esc_id: str, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     return escalation.view(identity.parent_id, esc_id)
 
 
-@app.post("/ally/escalations/{esc_id}/reply")
+@api.post("/escalations/{esc_id}/reply")
 async def escalation_reply(esc_id: str, body: EscalationReplyIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_family(identity)
     esc = await escalation.reply(identity.parent_id, esc_id, responder=identity.member_id, decision=body.decision)
-    return {k: v for k, v in esc.items() if k != "task_token"}
+    return {k: v for k, v in esc.items() if k != "machine"}
 
 
-@app.post("/ally/escalations/reply")
+@api.get("/escalations/{esc_id}/handoff")
+def escalation_handoff(esc_id: str, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    require_family(identity)
+    return handoff.note(identity.parent_id, esc_id, identity.member_id)
+
+
+@api.post("/escalations/reply")
 async def escalation_token_reply(body: TokenReplyIn) -> dict[str, Any]:
     """Called from the service worker's notification action (no JWT available there)."""
     claims = tokens.verify(body.reply_token)
@@ -435,22 +494,49 @@ async def escalation_token_reply(body: TokenReplyIn) -> dict[str, Any]:
     return {"ok": True, "status": esc.get("status")}
 
 
-# ---- watch ------------------------------------------------------------------------------------
+# ---- devices: watch, phone, guard handset ------------------------------------------------------
 
 
-@app.post("/ally/watch")
-async def watch(body: WatchIn, x_ally_device_key: str | None = Header(default=None)) -> dict[str, Any]:
-    verify_device_key(x_ally_device_key)
-    from config import PARENT_ID
+def _device_key(x_ally_device_key: str | None, x_suraksha_device_key: str | None) -> str | None:
+    return x_ally_device_key or x_suraksha_device_key
 
-    return await orchestrator.on_watch(PARENT_ID, body.kind, steps=body.steps, heart_rate=body.heart_rate)
+
+@api.post("/watch")
+@api.post("/device")
+async def device_event(
+    body: WatchIn,
+    x_ally_device_key: str | None = Header(default=None),
+    x_suraksha_device_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_device_key(_device_key(x_ally_device_key, x_suraksha_device_key), body.source)
+    return await orchestrator.on_watch(
+        PARENT_ID, body.kind, steps=body.steps, heart_rate=body.heart_rate, source=body.source
+    )
+
+
+@api.get("/guard/call")
+async def guard_call(
+    speak: bool = False,
+    x_ally_device_key: str | None = Header(default=None),
+    x_suraksha_device_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The neighbour's handset polls this; it rings once the workflow has asked the neighbour."""
+    verify_device_key(_device_key(x_ally_device_key, x_suraksha_device_key), "guard")
+    call = handoff.guard_call(PARENT_ID)
+    if speak and call.get("ringing") and call.get("say"):
+        try:
+            clip = await speech.synthesize(call["say"], "en-IN")
+            call["tts"] = {"audio_base64": clip["audio_base64"], "mime_type": clip["mime_type"]}
+        except Exception as exc:  # he reads it instead
+            log("guard_tts_failed", error=repr(exc))
+    return call
 
 
 # ---- dev only ---------------------------------------------------------------------------------
 
 if DEV_TOOLS:
 
-    @app.post("/ally/dev/sweep")
+    @api.post("/dev/sweep")
     async def dev_sweep() -> dict[str, Any]:
         return await orchestrator.sweep()
 
@@ -469,6 +555,10 @@ def _allowed_silently(parent_id: str, identity: Identity, action: str, topic: st
         requested_by=f"Family::{identity.member_id}",
         audit=False,
     ).allowed
+
+
+app.include_router(api, prefix="/ally")
+app.include_router(api, prefix="/suraksha")
 
 
 if __name__ == "__main__":

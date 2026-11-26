@@ -1,0 +1,55 @@
+# Render Blueprint: the Ally API (Docker, free) and the web app (static site, free).
+# Secrets marked `sync: false` are entered in the Render dashboard on first deploy.
+services:
+  - type: web
+    name: suraksha-api
+    runtime: docker
+    plan: free
+    rootDir: ally
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: WISPR_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: groq/llama-3.3-70b-versatile
+      - key: LLM_FALLBACK_MODEL
+        value: gemini/gemini-2.5-flash
+      - key: ALLY_JWT_SECRET
+        generateValue: true
+      - key: ALLY_HMAC_SECRET
+        generateValue: true
+      - key: ALLY_CRON_SECRET
+        generateValue: true
+      - key: ALLY_DEVICE_KEY
+        generateValue: true
+      - key: ALLY_VAPID_PUBLIC_KEY
+        sync: false
+      - key: ALLY_VAPID_PRIVATE_KEY
+        sync: false
+      - key: ALLY_SEED_PASSWORD
+        sync: false
+      - key: PUBLIC_WEB_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: ALLY_INPROC_SCHEDULER
+        value: "0"
+
+  - type: web
+    name: suraksha-web
+    runtime: static
+    rootDir: web
+    buildCommand: npm ci && npm run build
+    staticPublishPath: out
+    envVars:
+      - key: NEXT_PUBLIC_SURAKSHA_API_URL
+        sync: false
+      - key: NEXT_PUBLIC_AUTH
+        value: jwt

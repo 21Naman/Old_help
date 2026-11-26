@@ -1,18 +1,8 @@
-# Shared layers, two targets:
-#   api    — FastAPI under uvicorn, fronted by the Lambda Web Adapter extension
-#   worker — plain Lambda handlers (sweep + Step Functions steps) via awslambdaric
-FROM public.ecr.aws/docker/library/python:3.12-slim AS base
-WORKDIR /var/task
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# Ally API on Render (or any container host): FastAPI under uvicorn on $PORT.
+FROM python:3.12-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PORT=8002
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt awslambdaric
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-
-FROM base AS api
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt/extensions/lambda-adapter
-ENV AWS_LWA_PORT=8080 AWS_LWA_READINESS_CHECK_PATH=/health
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
-
-FROM base AS worker
-ENTRYPOINT ["python", "-m", "awslambdaric"]
-CMD ["lambda_worker.handler"]
+CMD ["sh", "-c", "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT} --no-access-log"]

@@ -43,3 +43,7 @@ infra/cdk-outputs.json
 */public/world/templerun.mp3
 */public/world/nether.mp3
 */public/world/level2.mp3
+
+# Local SQLite database
+ally/ally.db
+ally/ally.db-*

@@ -1,6 +1,8 @@
-"""Live smoke test against Bedrock: every schema, real calls, non-zero exit on any failure.
+"""Live smoke test against the configured LLM: every schema, real calls, non-zero exit on any failure.
 
-    python scripts/smoke_bedrock.py
+    python scripts/smoke_llm.py                                   # LLM_MODEL (with fallback)
+    LLM_FALLBACK_MODEL= python scripts/smoke_llm.py               # primary only
+    LLM_MODEL=gemini/gemini-2.5-flash LLM_FALLBACK_MODEL= python scripts/smoke_llm.py
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agents.schemas import DeviationJudgment, EvidenceAnswer, HealthProbe, MorningCheckin  # noqa: E402
-from llm.bedrock import structured  # noqa: E402
+from llm.client import structured  # noqa: E402
 from scoring.deviation import utterance_gate  # noqa: E402
 
 

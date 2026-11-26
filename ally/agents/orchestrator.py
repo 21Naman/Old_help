@@ -1,7 +1,7 @@
 """Deterministic event engine. The model handles language and judgement; code decides what happens.
 
-Events: parent turn, watch signal, "I'm okay", and the one-minute sweep (reminders, wake window,
-investigation timeouts).
+Events: parent turn, device signal (watch or phone), "I'm okay", and the one-minute sweep
+(reminders, wake window, investigation and escalation timeouts).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from core.errors import LLMError, NotConfigured
 from core.ids import new_id
 from core.names import display
 from core.log import log
+from escalation import machine as escalation_machine
 from escalation import service as escalation
 from policy import consent
 from policy.tiers import TIER_LABEL, decide
@@ -146,28 +147,37 @@ async def _assess_parent_words(
     return await _escalate(parent_id, alert, tier.severity)
 
 
-# ---- watch & I'm okay ---------------------------------------------------------------------
+# ---- devices (watch or phone) & I'm okay -----------------------------------------------------
 
 
-async def on_watch(parent_id: str, kind: str, *, steps: int | None = None, heart_rate: int | None = None) -> dict[str, Any]:
+async def on_watch(
+    parent_id: str,
+    kind: str,
+    *,
+    steps: int | None = None,
+    heart_rate: int | None = None,
+    source: str = "watch",
+) -> dict[str, Any]:
+    """A sensor event from the watch or the phone. Both may be worn; events dedupe by day / window."""
     repo = get_repo()
     now = clock.now()
-    signal = repo.add_signal(parent_id, kind, steps=steps, heart_rate=heart_rate)
+    signal = repo.add_signal(parent_id, kind, steps=steps, heart_rate=heart_rate, source=source)
     if kind == "im_okay":
-        return {"signal": signal, **(await on_im_okay(parent_id, source="watch"))}
+        return {"signal": signal, **(await on_im_okay(parent_id, source=source))}
     if kind == "fall":
-        return {"signal": signal, **(await on_possible_fall(parent_id, now))}
+        return {"signal": signal, **(await on_possible_fall(parent_id, now, source=source))}
     if kind not in ("wake", "first_movement"):
         return {"signal": signal}
 
     today = clock.local_date(now)
     if not repo.set_day_if_absent(parent_id, today, "wake_at", clock.iso(now)):
         return {"signal": signal, "first_wake": False}
+    repo.update_day(parent_id, today, wake_source=source)
 
     scheduled = reminders.schedule_after_wake(parent_id, now)
     resolved = False
     if repo.open_investigation(parent_id) or repo.active_escalation_id(parent_id):
-        await on_im_okay(parent_id, source="watch_wake")
+        await on_im_okay(parent_id, source=f"{source}_wake")
         resolved = True
     result: dict[str, Any] = {"signal": signal, "first_wake": True, "after_wake_reminders": scheduled, "resolved": resolved}
     try:
@@ -179,22 +189,22 @@ async def on_watch(parent_id: str, kind: str, *, steps: int | None = None, heart
     return result
 
 
-async def on_possible_fall(parent_id: str, now: Any) -> dict[str, Any]:
-    """The watch thinks she fell. Ask her first — one short question — then escalate fast if she can't answer.
+async def on_possible_fall(parent_id: str, now: Any, *, source: str = "watch") -> dict[str, Any]:
+    """The watch or phone thinks she fell. Ask her first — one short question — then escalate fast if she can't answer.
 
     A fall is never a silent alert and never an immediate blast to the family: she gets a moment to
     say she is fine, and the window is minutes rather than the quarter hour a late wake-up gets.
     """
     repo = get_repo()
     profile = _profile(parent_id)
-    # The watch can fire twice on one tumble; one question per cooldown window.
+    # One tumble can fire twice, or on both the watch and the phone; one question per window.
     if not repo.claim_dedupe(parent_id, f"alert#fall#{clock.iso(now)[:15]}"):
         return {"fall": True, "skipped": "duplicate"}
     if repo.active_escalation_id(parent_id):
         return {"fall": True, "skipped": "already_escalating"}
 
-    gate = deviation.GateResult(True, 0.8, [{"code": "watch_detected_possible_fall", "level": "strong"}])
-    alert = _new_alert(parent_id, kind="fall", gate=gate, judgment=None, tier=1, status="investigating")
+    gate = deviation.GateResult(True, 0.8, [{"code": f"{source}_detected_possible_fall", "level": "strong"}])
+    alert = _new_alert(parent_id, kind="fall", gate=gate, judgment=None, tier=1, status="investigating", source=source)
     inv = _open_investigation(parent_id, alert, now, minutes=FALL_WINDOW_MIN, reason="fall")
     hi = profile.get("language") == "hi-IN"
     body = (
@@ -245,7 +255,7 @@ async def on_im_okay(parent_id: str, *, source: str) -> dict[str, Any]:
     return {"okay": True, "investigation_closed": bool(investigation), "escalation_stopped": bool(stopped)}
 
 
-# ---- sweep (EventBridge Scheduler, every minute) ---------------------------------------------
+# ---- sweep (every minute: external cron or the in-process scheduler) ------------------------
 
 
 async def sweep() -> dict[str, Any]:
@@ -264,6 +274,14 @@ async def sweep() -> dict[str, Any]:
             out["investigations"] += 1
         except Exception as exc:
             log("investigation_timeout_failed", parent_id=inv["parent_id"], error=repr(exc))
+    try:
+        out["escalations"] = await escalation_machine.sweep_timeouts()
+    except Exception as exc:
+        log("escalation_sweep_failed", error=repr(exc))
+    try:
+        out["purged"] = repo.purge_expired()
+    except Exception as exc:
+        log("purge_failed", error=repr(exc))
     return out
 
 
@@ -344,6 +362,7 @@ def _new_alert(
     judgment: DeviationJudgment | None,
     tier: int,
     status: str,
+    source: str | None = None,
 ) -> dict[str, Any]:
     alert = {
         "id": new_id(),
@@ -354,6 +373,7 @@ def _new_alert(
         "gate": gate.reasons if gate else [],
         "gate_score": gate.score if gate else None,
         "judgment": judgment.model_dump() if judgment else None,
+        "source": source,
     }
     get_repo().put_alert(parent_id, alert)
     return alert
@@ -542,4 +562,4 @@ def _summary(esc: dict[str, Any] | None, members: list[dict[str, Any]], profile:
 
 
 def _alert_view(alert: dict[str, Any]) -> dict[str, Any]:
-    return {k: alert.get(k) for k in ("id", "created_at", "kind", "status", "tier", "judgment", "escalation_id")}
+    return {k: alert.get(k) for k in ("id", "created_at", "kind", "status", "tier", "judgment", "escalation_id", "source")}

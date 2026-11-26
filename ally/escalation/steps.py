@@ -1,12 +1,11 @@
-"""Step Functions task handlers for the FamilyEscalation workflow.
+"""Step handlers for the FamilyEscalation workflow (driven by `escalation.machine`).
 
-Every contact goes through Cedar first. Callback steps store the task token and return immediately;
-the reply endpoint resumes the workflow with SendTaskSuccess.
+Every contact goes through Cedar first. Asking steps mark the escalation as `awaiting` and return
+immediately; a reply or the sweep's timeout resumes the workflow.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from core import clock
@@ -55,16 +54,13 @@ async def ask_contact(event: dict[str, Any]) -> dict[str, Any]:
         esc_id,
         status="asking",
         current_contact=member_id,
-        task_token=event["token"],
+        awaiting=True,
         token_version=version,
         contacted=sorted({*esc.get("contacted", []), member_id}),
     )
     if not decision.allowed:
-        # Resume straight away as a decline so the workflow moves on.
-        from escalation.service import _sfn
-
-        repo.update_escalation(parent_id, esc_id, task_token=None, token_version=version + 1)
-        _sfn().send_task_success(taskToken=event["token"], output=json.dumps({"decision": "not_permitted"}))
+        # Not allowed to ask this person: the workflow moves straight on.
+        repo.update_escalation(parent_id, esc_id, awaiting=None, token_version=version + 1)
         return {"asked": False}
 
     reply_token = tokens.sign(parent_id, esc_id, member_id, version)
@@ -93,7 +89,7 @@ async def next_contact(event: dict[str, Any]) -> dict[str, Any]:
     repo.append_escalation_event(parent_id, esc_id, {"event": outcome, "member": member_id})
     esc = repo.get_escalation(parent_id, esc_id) or {}
     repo.update_escalation(
-        parent_id, esc_id, task_token=None, current_contact=None, token_version=int(esc.get("token_version", 0)) + 1
+        parent_id, esc_id, awaiting=None, current_contact=None, token_version=int(esc.get("token_version", 0)) + 1
     )
     return {"index": index + 1}
 
@@ -137,10 +133,7 @@ async def ask_parent_neighbour(event: dict[str, Any]) -> dict[str, Any]:
     esc = repo.get_escalation(parent_id, esc_id) or {}
     version = int(esc.get("token_version", 0)) + 1
     if not neighbours:
-        from escalation.service import _sfn
-
         repo.update_escalation(parent_id, esc_id, token_version=version)
-        _sfn().send_task_success(taskToken=event["token"], output=json.dumps({"decision": "no_neighbour"}))
         return {"asked": False}
     neighbour = neighbours[0]
     profile = repo.get_profile(parent_id) or {}
@@ -151,7 +144,7 @@ async def ask_parent_neighbour(event: dict[str, Any]) -> dict[str, Any]:
         status="asking_parent",
         current_contact="parent",
         neighbour_id=neighbour["id"],
-        task_token=event["token"],
+        awaiting=True,
         token_version=version,
     )
     body = (
@@ -176,7 +169,7 @@ async def contact_neighbour(event: dict[str, Any]) -> dict[str, Any]:
     parent_id, esc_id = event["parent_id"], event["esc_id"]
     reply = (event.get("reply") or {}).get("decision", "timeout")
     esc = repo.get_escalation(parent_id, esc_id) or {}
-    repo.update_escalation(parent_id, esc_id, task_token=None, current_contact=None)
+    repo.update_escalation(parent_id, esc_id, awaiting=None, current_contact=None)
     repo.append_escalation_event(parent_id, esc_id, {"event": f"parent_{reply}"})
     neighbour_id = esc.get("neighbour_id")
     if not neighbour_id or reply in ("deny", "no_neighbour"):
@@ -194,6 +187,7 @@ async def contact_neighbour(event: dict[str, Any]) -> dict[str, Any]:
     )
     if not decision.allowed:
         return {"contacted": False}
+    version = int(esc.get("token_version", 0)) + 1
     await channel.post(
         parent_id,
         audience=neighbour_id,
@@ -202,10 +196,52 @@ async def contact_neighbour(event: dict[str, Any]) -> dict[str, Any]:
         body=f"Her family couldn't be reached. Could you look in on {profile.get('name', 'Amma')}?",
         related_id=f"esc#{esc_id}#neighbour",
         data={"esc_id": esc_id},
+        push_extra={
+            "esc_id": esc_id,
+            "reply_token": tokens.sign(parent_id, esc_id, neighbour_id, version),
+            "actions": ["accept", "decline"],
+        },
     )
-    repo.update_escalation(parent_id, esc_id, contacted=sorted({*esc.get("contacted", []), neighbour_id}))
+    repo.update_escalation(
+        parent_id,
+        esc_id,
+        status="asking_neighbour",
+        current_contact=neighbour_id,
+        awaiting=True,
+        token_version=version,
+        contacted=sorted({*esc.get("contacted", []), neighbour_id}),
+    )
     repo.append_escalation_event(parent_id, esc_id, {"event": "neighbour_contacted", "member": neighbour_id})
     return {"contacted": True}
+
+
+async def neighbour_accepted(event: dict[str, Any]) -> dict[str, Any]:
+    repo = get_repo()
+    parent_id, esc_id = event["parent_id"], event["esc_id"]
+    esc = repo.get_escalation(parent_id, esc_id) or {}
+    neighbour_id = esc.get("neighbour_id", "")
+    member = repo.get_member(parent_id, neighbour_id) or {"name": neighbour_id}
+    profile = repo.get_profile(parent_id) or {}
+    hi = profile.get("language") == "hi-IN"
+    repo.update_escalation(parent_id, esc_id, status="accepted", responder=neighbour_id, current_contact=None)
+    repo.append_escalation_event(parent_id, esc_id, {"event": "accepted", "member": neighbour_id})
+    await channel.post(
+        parent_id,
+        audience="parent",
+        kind="escalation_update",
+        body=f"{display(member, 'hi-IN')} आपसे मिलने आ रहे हैं।" if hi else f"{member['name']} is on the way to see you.",
+        related_id=f"esc#{esc_id}#accepted",
+    )
+    for other in esc.get("contacted", []):
+        if other != neighbour_id:
+            await channel.post(
+                parent_id,
+                audience=other,
+                kind="escalation_update",
+                body=f"{member['name']} is going to check on {profile.get('name', 'Amma')}.",
+                related_id=f"esc#{esc_id}#covered#{other}",
+            )
+    return {"accepted": True}
 
 
 async def notify_all(event: dict[str, Any]) -> dict[str, Any]:
@@ -245,7 +281,8 @@ async def finish(event: dict[str, Any]) -> dict[str, Any]:
     parent_id, esc_id = event["parent_id"], event["esc_id"]
     esc = repo.get_escalation(parent_id, esc_id) or {}
     if esc.get("status") not in ("accepted", "resolved", "stopped"):
-        repo.update_escalation(parent_id, esc_id, status="closed", closed_at=clock.iso(clock.now()), task_token=None)
+        repo.update_escalation(parent_id, esc_id, status="closed", closed_at=clock.iso(clock.now()), awaiting=None)
+        repo.set_escalation_due(parent_id, esc_id, None)
         repo.release_escalation_lock(parent_id, esc_id)
     return {"done": True}
 
@@ -253,19 +290,8 @@ async def finish(event: dict[str, Any]) -> dict[str, Any]:
 async def failsafe(event: dict[str, Any]) -> dict[str, Any]:
     log("escalation_failsafe", payload=event)
     await notify_all({**event, "reason": "workflow_error"})
-    get_repo().update_escalation(event["parent_id"], event["esc_id"], status="failed")
+    get_repo().update_escalation(event["parent_id"], event["esc_id"], status="failed", awaiting=None)
+    get_repo().set_escalation_due(event["parent_id"], event["esc_id"], None)
     get_repo().release_escalation_lock(event["parent_id"], event["esc_id"])
     return {"failsafe": True}
 
-
-STEPS = {
-    "init": init,
-    "ask_contact": ask_contact,
-    "next_contact": next_contact,
-    "accepted": accepted,
-    "ask_parent_neighbour": ask_parent_neighbour,
-    "contact_neighbour": contact_neighbour,
-    "notify_all": notify_all,
-    "finish": finish,
-    "failsafe": failsafe,
-}

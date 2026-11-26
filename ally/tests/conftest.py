@@ -1,4 +1,4 @@
-"""Offline fixtures: moto DynamoDB, a frozen IST clock, no network (push/SFN/LLM are faked per test)."""
+"""Offline fixtures: in-memory SQLite, a frozen IST clock, no network (push/workflow/LLM are faked per test)."""
 
 from __future__ import annotations
 
@@ -8,23 +8,18 @@ from typing import Any
 
 os.environ.update(
     {
-        "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_SESSION_TOKEN": "testing",
-        "AWS_DEFAULT_REGION": "us-east-1",
-        "AWS_REGION": "us-east-1",
-        "ALLY_TABLE": "AllyTest",
+        "DATABASE_URL": "sqlite://",
         "ALLY_HMAC_SECRET": "test-secret",
         "ALLY_DEVICE_KEY": "device-key",
-        "ALLY_STATE_MACHINE_ARN": "",
+        "ALLY_JWT_SECRET": "test-jwt-secret-at-least-32-bytes-long",
+        "ALLY_CRON_SECRET": "cron-secret",
         "ALLY_VAPID_PRIVATE_KEY": "",
-        "ALLY_SECRET_NAME": "",
+        "ALLY_INPROC_SCHEDULER": "",
+        "WISPR_API_KEY": "",
     }
 )
 
-import boto3  # noqa: E402
 import pytest  # noqa: E402
-from moto import mock_aws  # noqa: E402
 
 from core import clock  # noqa: E402
 from policy import consent  # noqa: E402
@@ -32,34 +27,11 @@ from store import repo as repo_mod  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def aws():
-    with mock_aws():
-        ddb = boto3.resource("dynamodb", region_name="us-east-1")
-        table = ddb.create_table(
-            TableName="AllyTest",
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
-            AttributeDefinitions=[
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"},
-                {"AttributeName": "gsi1pk", "AttributeType": "S"},
-                {"AttributeName": "gsi1sk", "AttributeType": "S"},
-            ],
-            GlobalSecondaryIndexes=[
-                {
-                    "IndexName": "gsi1",
-                    "KeySchema": [
-                        {"AttributeName": "gsi1pk", "KeyType": "HASH"},
-                        {"AttributeName": "gsi1sk", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                }
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
-        repo_mod.set_repo(repo_mod.Repo(table))
-        consent._cache.clear()
-        yield
-        repo_mod.set_repo(None)
+def db():
+    repo_mod.set_repo(repo_mod.Repo("sqlite://"))
+    consent._cache.clear()
+    yield
+    repo_mod.set_repo(None)
 
 
 @pytest.fixture(autouse=True)
@@ -105,33 +77,25 @@ def pushes(monkeypatch) -> list[dict[str, Any]]:
     return sent
 
 
-class FakeSfn:
+class FakeMachine:
+    """Records workflow starts and resumes so step tests can drive each step themselves."""
+
     def __init__(self) -> None:
-        self.success: list[tuple[str, str]] = []
-        self.stopped: list[str] = []
-        self.started: list[dict[str, Any]] = []
-        self.timed_out_tokens: set[str] = set()
+        self.started: list[str] = []
+        self.resumed: list[tuple[str, str]] = []
 
-    def send_task_success(self, taskToken: str, output: str) -> None:
-        from botocore.exceptions import ClientError
+    async def start(self, parent_id: str, esc_id: str) -> None:
+        self.started.append(esc_id)
 
-        if taskToken in self.timed_out_tokens:
-            raise ClientError({"Error": {"Code": "TaskTimedOut", "Message": "timed out"}}, "SendTaskSuccess")
-        self.success.append((taskToken, output))
-
-    def stop_execution(self, executionArn: str, cause: str) -> None:
-        self.stopped.append(executionArn)
-
-    def start_execution(self, stateMachineArn: str, name: str, input: str) -> dict[str, Any]:
-        self.started.append({"name": name, "input": input})
-        return {"executionArn": f"arn:aws:states:us-east-1:1:execution:esc:{name}"}
+    async def resume(self, parent_id: str, esc_id: str, decision: str) -> None:
+        self.resumed.append((esc_id, decision))
 
 
 @pytest.fixture
-def sfn(monkeypatch) -> FakeSfn:
-    fake = FakeSfn()
-    from escalation import service
+def sfn(monkeypatch) -> FakeMachine:
+    fake = FakeMachine()
+    from escalation import machine
 
-    monkeypatch.setattr(service, "_sfn", lambda: fake)
-    monkeypatch.setattr(service, "STATE_MACHINE_ARN", "arn:aws:states:us-east-1:1:stateMachine:esc")
+    monkeypatch.setattr(machine, "start", fake.start)
+    monkeypatch.setattr(machine, "resume", fake.resume)
     return fake

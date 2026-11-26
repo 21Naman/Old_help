@@ -1,7 +1,7 @@
 "use client";
 
 import { surakshaApiUrl } from "./surakshaTypes";
-import { authEnabled, devMember, idToken } from "./amplify";
+import { authEnabled, devMember, idToken, setToken } from "./session";
 
 export class ApiError extends Error {
   constructor(
@@ -35,6 +35,11 @@ export async function api<T>(path: string, init: RequestInit & { json?: unknown 
   }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401 && authEnabled()) {
+      // The stored token expired or was revoked: drop it so the gate asks for a fresh sign-in.
+      setToken(null);
+      window.location.reload();
+    }
     throw new ApiError(res.status, body.error ?? "error", body.message ?? "Something went wrong.", body.say);
   }
   return body as T;

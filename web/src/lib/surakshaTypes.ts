@@ -62,6 +62,8 @@ export interface SurakshaAlertView {
   tier: number;
   judgment?: DeviationJudgment | null;
   escalation_id?: string | null;
+  /** Which device raised it, when the API says: "watch" (Wear OS) or "phone" (Android sensors). */
+  source?: "watch" | "phone" | string | null;
 }
 
 export interface ConsentRule {

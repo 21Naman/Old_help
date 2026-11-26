@@ -9,7 +9,7 @@ from typing import Any
 
 from agents.schemas import MorningCheckin
 from core import clock
-from llm.bedrock import structured
+from llm.client import structured
 from proactive import channel
 from store.repo import get_repo
 

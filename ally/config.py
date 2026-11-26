@@ -1,4 +1,4 @@
-"""Ally runtime config. Every value is an env var so local, Lambda and tests share one code path."""
+"""Ally runtime config. Every value is an env var so local, Render and tests share one code path."""
 
 from __future__ import annotations
 
@@ -27,29 +27,43 @@ def _b(key: str) -> bool:
 
 PARENT_ID = _s("ALLY_PARENT_ID", "amma")
 HOST = _s("ALLY_HOST", "0.0.0.0")
-PORT = _i("ALLY_PORT", 8002)
+PORT = _i("PORT", _i("ALLY_PORT", 8002))  # Render sets PORT
 TZ = _s("ALLY_TZ", "Asia/Kolkata")
 
-AWS_REGION = _s("AWS_REGION", _s("AWS_DEFAULT_REGION", "us-east-1"))
-# Nova 2 Lite has no in-region id: use a us./eu./jp. geo profile or global.
-BEDROCK_MODEL_ID = _s("BEDROCK_MODEL_ID", "us.amazon.nova-2-lite-v1:0")
-BEDROCK_MAX_TOKENS = _i("BEDROCK_MAX_TOKENS", 800)
+# SQLAlchemy URL. Neon/Render give `postgresql://…`; locally and in tests SQLite is enough.
+DATABASE_URL = _s("DATABASE_URL", f"sqlite:///{ALLY_ROOT / 'ally.db'}")
 
-TABLE_NAME = _s("ALLY_TABLE", "Ally")
-STATE_MACHINE_ARN = _s("ALLY_STATE_MACHINE_ARN")
-SECRET_NAME = _s("ALLY_SECRET_NAME")  # AWS Secrets Manager bundle; empty locally (env vars win)
+# Any LiteLLM model id. Keys come from the provider's own env var (GROQ_API_KEY, GEMINI_API_KEY).
+LLM_MODEL = _s("LLM_MODEL", "groq/llama-3.3-70b-versatile")
+# A second provider. A turn that fails on the primary is re-run here before Ally reports llm_unavailable.
+LLM_FALLBACK_MODEL = _s("LLM_FALLBACK_MODEL", "gemini/gemini-2.5-flash")
+LLM_MAX_TOKENS = _i("LLM_MAX_TOKENS", 800)
+LLM_TIMEOUT_S = _i("LLM_TIMEOUT_S", 25)
 
-COGNITO_USER_POOL_ID = _s("COGNITO_USER_POOL_ID")
-COGNITO_CLIENT_ID = _s("COGNITO_CLIENT_ID")
 
-POLLY_VOICE = _s("ALLY_POLLY_VOICE", "Kajal")
-POLLY_ENGINE = _s("ALLY_POLLY_ENGINE", "generative")
-# "identify" lets Transcribe pick en-IN/hi-IN per clip; "fixed" uses the parent's language.
-TRANSCRIBE_MODE = _s("ALLY_TRANSCRIBE_MODE", "identify")
+def llm_model_for(task: str) -> str:
+    """Per-task override, e.g. LLM_MODEL_MORNING_CHECKIN=groq/llama-3.1-8b-instant to save quota."""
+    return _s(f"LLM_MODEL_{task.upper()}", LLM_MODEL)
 
-# Second region for the same Bedrock model. A turn that fails on a throttle or a
-# 5xx in the primary region is retried here before Ally reports llm_unavailable.
-BEDROCK_FAILOVER_REGION = _s("BEDROCK_FAILOVER_REGION", "us-west-2")
+
+# Speech-to-text: Wispr Flow first, Groq Whisper when Wispr has no key or fails.
+WISPR_API_KEY = _s("WISPR_API_KEY")
+WISPR_API_URL = _s("WISPR_API_URL", "https://platform-api.wisprflow.ai/api/v1/dash/api")
+GROQ_STT_MODEL = _s("GROQ_STT_MODEL", "whisper-large-v3")
+
+# Text-to-speech (Microsoft Edge neural voices via edge-tts), one voice per language.
+TTS_VOICE_HI = _s("ALLY_TTS_VOICE_HI", "hi-IN-SwaraNeural")
+TTS_VOICE_EN = _s("ALLY_TTS_VOICE_EN", "en-IN-NeerjaNeural")
+
+
+# Login tokens are HS256 JWTs signed with this secret. Required when deployed.
+JWT_SECRET = _s("ALLY_JWT_SECRET")
+JWT_TTL_H = _i("ALLY_JWT_TTL_H", 24 * 30)
+
+# The per-minute sweep: an external cron calls POST /ally/cron/sweep with this header value.
+CRON_SECRET = _s("ALLY_CRON_SECRET")
+# Local runs (and a single always-on instance) can run the sweep in-process instead.
+INPROC_SCHEDULER = _b("ALLY_INPROC_SCHEDULER")
 
 VAPID_SUBJECT = _s("ALLY_VAPID_SUBJECT", "mailto:team@ally.care")
 PUBLIC_WEB_URL = _s("PUBLIC_WEB_URL", "http://localhost:3000")
@@ -70,6 +84,3 @@ WAKE_GRACE_MIN = _i("WAKE_GRACE_MIN", 15)
 FAMILY_ASK_DAILY_LIMIT = _i("FAMILY_ASK_DAILY_LIMIT", 20)
 MESSAGE_EXPIRY_MIN = _i("MESSAGE_EXPIRY_MIN", 120)
 
-
-def on_lambda() -> bool:
-    return bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))

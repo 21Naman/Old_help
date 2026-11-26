@@ -1,10 +1,8 @@
-import json
-import time
-
 import pytest
 
+from core import clock
 from core.errors import Conflict, Forbidden
-from escalation import service, steps, tokens
+from escalation import machine, service, steps, tokens
 from policy import consent
 
 
@@ -22,7 +20,7 @@ async def _start(repo, sfn):
 
 async def test_start_takes_lock_and_starts_workflow(seeded, repo, sfn, pushes):
     esc_id = await _start(repo, sfn)
-    assert sfn.started[0]["name"] == esc_id
+    assert sfn.started == [esc_id]
     assert repo.active_escalation_id("amma") == esc_id
     again = await service.start("amma", _alert(repo), "high")
     assert again["id"] == esc_id and len(sfn.started) == 1  # one open escalation per parent
@@ -32,13 +30,13 @@ async def test_ask_contact_then_accept_via_push_token(seeded, repo, sfn, pushes)
     esc_id = await _start(repo, sfn)
     state = await steps.init({"parent_id": "amma", "esc_id": esc_id})
     assert state["contacts"] == ["rahul", "priya"]
-    await steps.ask_contact({**state, "token": "tok-rahul"})
+    await steps.ask_contact(state)
     ask = pushes[-1]
     assert ask["audience"] == "rahul" and ask["type"] == "escalation_ask" and ask["reply_token"]
 
     claims = tokens.verify(ask["reply_token"])
     await service.reply("amma", esc_id, responder=claims["contact"], decision="accept", token_version=claims["token_version"])
-    assert sfn.success == [("tok-rahul", json.dumps({"decision": "accept"}))]
+    assert sfn.resumed == [(esc_id, "accept")]
 
     with pytest.raises(Conflict):  # double tap is single-use
         await service.reply("amma", esc_id, responder="rahul", decision="accept", token_version=claims["token_version"])
@@ -58,21 +56,22 @@ async def test_ask_contact_then_accept_via_push_token(seeded, repo, sfn, pushes)
 async def test_decline_moves_to_next_and_wrong_person_cannot_answer(seeded, repo, sfn, pushes):
     esc_id = await _start(repo, sfn)
     state = await steps.init({"parent_id": "amma", "esc_id": esc_id})
-    await steps.ask_contact({**state, "token": "tok-rahul"})
+    await steps.ask_contact(state)
     with pytest.raises(Conflict):
         await service.reply("amma", esc_id, responder="priya", decision="accept")
     await service.reply("amma", esc_id, responder="rahul", decision="decline")
     nxt = await steps.next_contact({**state, "reply": {"decision": "decline"}})
     assert nxt["index"] == 1
-    await steps.ask_contact({**state, "index": 1, "token": "tok-priya"})
+    await steps.ask_contact({**state, "index": 1})
     assert pushes[-1]["audience"] == "priya"
 
 
 async def test_late_reply_after_timeout_is_conflict(seeded, repo, sfn, pushes):
     esc_id = await _start(repo, sfn)
     state = await steps.init({"parent_id": "amma", "esc_id": esc_id})
-    await steps.ask_contact({**state, "token": "tok-rahul"})
-    sfn.timed_out_tokens.add("tok-rahul")
+    await steps.ask_contact(state)
+    esc = repo.get_escalation("amma", esc_id)
+    repo.consume_escalation_token("amma", esc_id, esc["token_version"])  # what the sweep does on timeout
     with pytest.raises(Conflict):
         await service.reply("amma", esc_id, responder="rahul", decision="accept")
 
@@ -80,13 +79,13 @@ async def test_late_reply_after_timeout_is_conflict(seeded, repo, sfn, pushes):
 async def test_neighbour_is_cedar_gated(seeded, repo, sfn, pushes):
     esc_id = await _start(repo, sfn)
     base = {"parent_id": "amma", "esc_id": esc_id}
-    await steps.ask_parent_neighbour({**base, "token": "tok-parent"})
+    await steps.ask_parent_neighbour(base)
     assert pushes[-1]["audience"] == "parent" and pushes[-1]["type"] == "neighbour_question"
 
     # high severity + timeout: not allowed without Amma's yes
     assert (await steps.contact_neighbour({**base, "reply": {"decision": "timeout"}}))["contacted"] is False
     # Amma says yes
-    await steps.ask_parent_neighbour({**base, "token": "tok-parent-2"})
+    await steps.ask_parent_neighbour(base)
     await service.reply("amma", esc_id, responder="parent", decision="confirm")
     assert (await steps.contact_neighbour({**base, "reply": {"decision": "confirm"}}))["contacted"] is True
     assert pushes[-1]["audience"] == "sunita"
@@ -112,20 +111,10 @@ async def test_notify_all_finish_and_failsafe_release_lock(seeded, repo, sfn, pu
 async def test_stop_tells_contacted_members(seeded, repo, sfn, pushes):
     esc_id = await _start(repo, sfn)
     state = await steps.init({"parent_id": "amma", "esc_id": esc_id})
-    await steps.ask_contact({**state, "token": "tok-rahul"})
+    await steps.ask_contact(state)
     stopped = await service.stop("amma", "parent_okay:watch")
-    assert stopped["status"] == "stopped" and sfn.stopped
+    assert stopped["status"] == "stopped" and "due_at" not in stopped and not repo.due_escalations(clock.now())
     assert pushes[-1]["audience"] == "rahul" and pushes[-1]["type"] == "all_clear"
-    assert repo.active_escalation_id("amma") is None
-
-
-async def test_missing_workflow_still_notifies_family(seeded, repo, pushes, monkeypatch):
-    from core.errors import NotConfigured
-
-    monkeypatch.setattr(service, "STATE_MACHINE_ARN", "")
-    with pytest.raises(NotConfigured):
-        await service.start("amma", _alert(repo), "high")
-    assert {p["audience"] for p in pushes} == {"rahul", "priya"}
     assert repo.active_escalation_id("amma") is None
 
 
@@ -151,16 +140,15 @@ async def test_denied_contact_resumes_workflow(seeded, repo, sfn, pushes, monkey
         return real(parent_id, **kw)
 
     monkeypatch.setattr(steps, "authorize", deny_rahul)
-    out = await steps.ask_contact({**state, "token": "tok-rahul"})
+    out = await steps.ask_contact(state)
     assert out["asked"] is False
-    assert sfn.success[-1] == ("tok-rahul", json.dumps({"decision": "not_permitted"}))
     assert not any(p["type"] == "escalation_ask" for p in pushes)
 
 
 async def test_stale_asks_are_retired_after_all_clear(seeded, repo, sfn, pushes):
     esc_id = await _start(repo, sfn)
     state = await steps.init({"parent_id": "amma", "esc_id": esc_id})
-    await steps.ask_contact({**state, "token": "tok-rahul"})
+    await steps.ask_contact(state)
     await service.stop("amma", "parent_okay:watch")
     asks = [m for m in repo._query_prefix("amma", "MSG#") if m["kind"] == "escalation_ask"]
     assert [m["status"] for m in asks] == ["superseded"]

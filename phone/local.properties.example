@@ -1,0 +1,3 @@
+# Copy to local.properties (git-ignored). Only the SDK path lives here:
+# API URL, web URL and device key are entered in the app's Settings screen.
+sdk.dir=/home/YOU/Android/Sdk

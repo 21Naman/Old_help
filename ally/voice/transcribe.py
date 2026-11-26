@@ -1,18 +1,22 @@
-"""Amazon Transcribe streaming for 16 kHz PCM16 WAV clips from the browser recorder.
+"""Speech-to-text for 16 kHz PCM16 WAV clips from the browser recorder.
 
-Hindi and Indian English are supported. In "identify" mode Transcribe chooses per clip between
-en-IN and hi-IN (preferring the parent's language); in "fixed" mode it uses her language only.
+Wispr Flow is the primary provider; it takes the WAV as-is. Groq Whisper is the second provider,
+used when Wispr has no key or fails. Both handle Hindi, Indian English and a mix of the two, and
+both are told the parent's language first so she never has to choose one.
 """
 
 from __future__ import annotations
 
-import asyncio
+import base64
 import io
 import wave
 from dataclasses import dataclass
 
-from config import AWS_REGION, TRANSCRIBE_MODE
+import httpx
+
+from config import GROQ_STT_MODEL, WISPR_API_KEY, WISPR_API_URL
 from core.errors import AllyError
+from core.log import log
 
 MAX_CLIP_SECONDS = 12
 LANGUAGE_OPTIONS = ["en-IN", "hi-IN"]
@@ -28,6 +32,7 @@ class Transcript:
     text: str
     language: str
     duration_sec: float
+    provider: str = ""
 
 
 def pcm_from_wav(raw: bytes) -> tuple[bytes, int, float]:
@@ -45,47 +50,52 @@ def pcm_from_wav(raw: bytes) -> tuple[bytes, int, float]:
     return frames, rate, duration
 
 
+def _bcp47(code: str | None, preferred: str) -> str:
+    """Providers answer with "hi"/"en" (or "hindi"); the rest of Ally speaks hi-IN / en-IN."""
+    code = (code or "").lower()
+    if code.startswith("hi"):
+        return "hi-IN"
+    if code.startswith("en"):
+        return "en-IN"
+    return preferred if preferred in LANGUAGE_OPTIONS else "hi-IN"
+
+
+async def _wispr(raw: bytes, preferred: str) -> tuple[str, str]:
+    first = "hi" if preferred == "hi-IN" else "en"
+    body = {
+        "audio": base64.b64encode(raw).decode(),
+        "language": [first, "en" if first == "hi" else "hi"],
+        "context": {"app": {"type": "other"}},
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(WISPR_API_URL, json=body, headers={"Authorization": f"Bearer {WISPR_API_KEY}"})
+    resp.raise_for_status()
+    data = resp.json()
+    return str(data.get("text") or ""), _bcp47(data.get("detected_language"), preferred)
+
+
+async def _groq_whisper(raw: bytes, preferred: str) -> tuple[str, str]:
+    import litellm
+
+    clip = io.BytesIO(raw)
+    clip.name = "clip.wav"
+    resp = await litellm.atranscription(
+        model=f"groq/{GROQ_STT_MODEL}",
+        file=clip,
+        response_format="verbose_json",
+        prompt="Hindi, Hinglish or Indian English.",
+    )
+    language = getattr(resp, "language", None) or (resp.get("language") if hasattr(resp, "get") else None)
+    return str(resp.text or ""), _bcp47(language, preferred)
+
+
 async def transcribe_wav(raw: bytes, preferred_language: str) -> Transcript:
-    from amazon_transcribe.client import TranscribeStreamingClient
-    from amazon_transcribe.handlers import TranscriptResultStreamHandler
-    from amazon_transcribe.model import TranscriptEvent
-
-    pcm, rate, duration = pcm_from_wav(raw)
-    texts: list[str] = []
-    detected: list[str] = []
-
-    class Handler(TranscriptResultStreamHandler):
-        async def handle_transcript_event(self, transcript_event: TranscriptEvent) -> None:
-            for result in transcript_event.transcript.results:
-                if result.is_partial or not result.alternatives:
-                    continue
-                texts.append(result.alternatives[0].transcript)
-                if getattr(result, "language_code", None):
-                    detected.append(result.language_code)
-
-    client = TranscribeStreamingClient(region=AWS_REGION)
-    if TRANSCRIBE_MODE == "identify":
-        stream = await client.start_stream_transcription(
-            language_code=None,
-            identify_language=True,
-            language_options=LANGUAGE_OPTIONS,
-            preferred_language=preferred_language if preferred_language in LANGUAGE_OPTIONS else "hi-IN",
-            media_sample_rate_hz=rate,
-            media_encoding="pcm",
-        )
-    else:
-        stream = await client.start_stream_transcription(
-            language_code=preferred_language,
-            media_sample_rate_hz=rate,
-            media_encoding="pcm",
-        )
-
-    async def write() -> None:
-        chunk = 8 * 1024
-        for i in range(0, len(pcm), chunk):
-            await stream.input_stream.send_audio_event(audio_chunk=pcm[i : i + chunk])
-        await stream.input_stream.end_stream()
-
-    await asyncio.gather(write(), Handler(stream.output_stream).handle_events())
-    language = detected[-1] if detected else preferred_language
-    return Transcript(" ".join(t.strip() for t in texts if t.strip()).strip(), language, duration)
+    _, _, duration = pcm_from_wav(raw)
+    if WISPR_API_KEY:
+        try:
+            text, language = await _wispr(raw, preferred_language)
+            return Transcript(text.strip(), language, duration, "wispr")
+        except Exception as exc:  # fall through to the second provider; logged, not hidden
+            log("stt_failover", frm="wispr", to="groq_whisper", error=repr(exc))
+    text, language = await _groq_whisper(raw, preferred_language)
+    return Transcript(text.strip(), language, duration, "groq_whisper")

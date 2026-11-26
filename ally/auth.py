@@ -1,21 +1,24 @@
-"""Identity. On Lambda, API Gateway's JWT authorizer already verified the Cognito token and the
-Lambda Web Adapter forwards the request context as the `x-amzn-request-context` header. Locally we
-verify the Cognito JWT ourselves; with ALLY_DEV_TOOLS=1 a dev header identity is accepted.
+"""Identity. Ally issues its own HS256 login tokens (POST /ally/auth/login) and verifies them here.
+With ALLY_DEV_TOOLS=1 a dev header identity is also accepted (local only).
 """
 
 from __future__ import annotations
 
 import hmac
-import json
+import time
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
-from fastapi import Header, Request
+import bcrypt
+import jwt
+from fastapi import Header
 
-from config import AWS_REGION, COGNITO_CLIENT_ID, COGNITO_USER_POOL_ID, DEV_TOOLS, PARENT_ID, on_lambda
+from config import DEV_TOOLS, JWT_SECRET, JWT_TTL_H, PARENT_ID
 from core.errors import AllyError, Forbidden
 from core.secrets import secret
+from store.repo import get_repo
+
+_ALG = "HS256"
 
 
 class Unauthorized(AllyError):
@@ -39,67 +42,64 @@ class Identity:
         return "parent" if self.is_parent else self.member_id
 
 
-def _parse_groups(raw: Any) -> frozenset[str]:
-    if isinstance(raw, list):
-        return frozenset(str(g) for g in raw)
-    text = str(raw or "").strip().strip("[]")
-    return frozenset(g.strip().strip('"') for g in text.replace(",", " ").split() if g.strip())
-
-
 def _identity_from_claims(claims: dict[str, Any]) -> Identity:
-    groups = _parse_groups(claims.get("cognito:groups"))
-    parent_id = str(claims.get("custom:parent_id") or PARENT_ID)
-    member_id = str(claims.get("custom:member_id") or ("parent" if "parent" in groups else ""))
+    groups = frozenset(str(g) for g in claims.get("groups") or [])
+    parent_id = str(claims.get("parent_id") or PARENT_ID)
+    member_id = str(claims.get("member_id") or ("parent" if "parent" in groups else ""))
     if not member_id or not groups & {"parent", "family"}:
         raise Forbidden("This account is not linked to a family yet.")
     return Identity(str(claims.get("sub")), parent_id, member_id, groups)
 
 
-@lru_cache(maxsize=1)
-def _jwks_client() -> Any:
-    import jwt
-
-    url = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
-    return jwt.PyJWKClient(url)
+def _signing_key() -> str:
+    if not JWT_SECRET:
+        raise Unauthorized("Sign-in is not configured.", detail="ALLY_JWT_SECRET missing")
+    return JWT_SECRET
 
 
-def _verify_locally(token: str) -> dict[str, Any]:
-    import jwt
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
-    if not COGNITO_USER_POOL_ID:
-        raise Unauthorized("Please sign in.", detail="COGNITO_USER_POOL_ID not set")
+
+def issue_token(user: dict[str, Any]) -> str:
+    now = int(time.time())  # wall clock, not Ally's (testable) clock: PyJWT checks exp against real time
+    claims = {
+        "sub": user["username"],
+        "groups": [user["group"]],
+        "parent_id": user["parent_id"],
+        "member_id": user["member_id"],
+        "iat": now,
+        "exp": now + JWT_TTL_H * 3600,
+    }
+    return jwt.encode(claims, _signing_key(), algorithm=_ALG)
+
+
+def login(username: str, password: str) -> dict[str, Any]:
+    user = get_repo().get_user(username.strip())
+    # Compare against a dummy hash when the user is unknown, so timing doesn't reveal usernames.
+    stored = (user or {}).get("password_hash") or "$2b$12$C6UzMDM.H6dfI/f/IKcEeO5u8kkD7G0Wf7u0n3u3mJr4l3cJm1o0e"
+    if not bcrypt.checkpw(password.encode(), stored.encode()) or not user:
+        raise Unauthorized("That username or password didn't match.")
+    return {"token": issue_token(user), "member_id": user["member_id"], "group": user["group"]}
+
+
+def _verify(token: str) -> dict[str, Any]:
     try:
-        key = _jwks_client().get_signing_key_from_jwt(token).key
-        return jwt.decode(
-            token,
-            key,
-            algorithms=["RS256"],
-            audience=COGNITO_CLIENT_ID,
-            issuer=f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}",
-        )
-    except Exception as exc:
+        return jwt.decode(token, _signing_key(), algorithms=[_ALG])
+    except jwt.PyJWTError as exc:
         raise Unauthorized("Please sign in again.", detail=repr(exc)) from exc
 
 
 def current_identity(
-    request: Request,
     authorization: str | None = Header(default=None),
     x_dev_member: str | None = Header(default=None),
 ) -> Identity:
-    if on_lambda():
-        raw = request.headers.get("x-amzn-request-context")
-        if not raw:
-            raise Unauthorized("Please sign in.", detail="missing request context")
-        claims = (((json.loads(raw).get("authorizer") or {}).get("jwt") or {}).get("claims")) or {}
-        if not claims:
-            raise Unauthorized("Please sign in.", detail="no jwt claims")
-        return _identity_from_claims(claims)
     if DEV_TOOLS and x_dev_member:
         groups = frozenset({"parent"}) if x_dev_member == "parent" else frozenset({"family"})
         return Identity(f"dev-{x_dev_member}", PARENT_ID, x_dev_member, groups)
     if not authorization or not authorization.lower().startswith("bearer "):
         raise Unauthorized("Please sign in.")
-    return _identity_from_claims(_verify_locally(authorization.split(" ", 1)[1]))
+    return _identity_from_claims(_verify(authorization.split(" ", 1)[1]))
 
 
 def require_parent(identity: Identity) -> Identity:
@@ -114,9 +114,11 @@ def require_family(identity: Identity) -> Identity:
     return identity
 
 
-def verify_device_key(provided: str | None) -> None:
-    expected = secret("DEVICE_KEY")
+def verify_device_key(provided: str | None, source: str = "watch") -> None:
+    """Each device may have its own key (ALLY_WATCH_DEVICE_KEY / ALLY_PHONE_DEVICE_KEY) so one can be
+    revoked alone; both fall back to the shared ALLY_DEVICE_KEY."""
+    expected = [k for k in (secret(f"{source.upper()}_DEVICE_KEY"), secret("DEVICE_KEY")) if k]
     if not expected:
         raise Unauthorized("Device key not configured.", detail="ALLY_DEVICE_KEY missing")
-    if not provided or not hmac.compare_digest(provided, expected):
+    if not provided or not any(hmac.compare_digest(provided, k) for k in expected):
         raise Unauthorized("Unknown device.")

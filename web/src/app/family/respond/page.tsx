@@ -2,18 +2,28 @@
 
 import { motion } from "framer-motion";
 import Link from "next/link";
-import { use, useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { ShieldGlyph } from "@/components/landing/BrandMark";
 import { Alert, ArrowRight, Check, Clock, Cross, Heart, Lock, People } from "@/components/ui/Icon";
 import { AppHeader, AppShell, Banner, PillLink } from "@/components/ui/Shell";
 import { ApiError, api } from "@/lib/api";
 import type { SurakshaState, Escalation, HandoffNote } from "@/lib/surakshaTypes";
-import type { Viewer } from "@/lib/amplify";
+import type { Viewer } from "@/lib/session";
 import { cn } from "@/lib/utils";
 
-export default function RespondPage({ params }: { params: Promise<{ escId: string }> }) {
-  const { escId } = use(params);
+/** /family/respond?id=<escId> — a query param so the page can be exported statically. */
+export default function RespondPage() {
+  return (
+    <Suspense>
+      <RespondRoute />
+    </Suspense>
+  );
+}
+
+function RespondRoute() {
+  const escId = useSearchParams().get("id") ?? "";
   return <AuthGate>{(viewer) => <Respond escId={escId} viewer={viewer} />}</AuthGate>;
 }
 
@@ -25,12 +35,16 @@ function Respond({ escId, viewer }: { escId: string; viewer: Viewer }) {
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
+    if (!escId) {
+      setError("This link is missing which alert it is for.");
+      return;
+    }
     // The handoff is loaded beside the rest: if Amma's rules leave nothing to show, the page
     // still works and simply has no card.
     const [e, s, h] = await Promise.allSettled([
-      api<Escalation>(`/suraksha/escalations/${escId}`),
+      api<Escalation>(`/suraksha/escalations/${encodeURIComponent(escId)}`),
       api<SurakshaState>("/suraksha/state"),
-      api<HandoffNote>(`/suraksha/escalations/${escId}/handoff`),
+      api<HandoffNote>(`/suraksha/escalations/${encodeURIComponent(escId)}/handoff`),
     ]);
     if (e.status === "fulfilled") setEsc(e.value);
     if (s.status === "fulfilled") setState(s.value);
@@ -52,7 +66,7 @@ function Respond({ escId, viewer }: { escId: string; viewer: Viewer }) {
     setBusy(true);
     setError(null);
     try {
-      await api(`/suraksha/escalations/${escId}/reply`, { method: "POST", json: { decision } });
+      await api(`/suraksha/escalations/${encodeURIComponent(escId)}/reply`, { method: "POST", json: { decision } });
       navigator.vibrate?.([40, 30, 80]);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not send.");

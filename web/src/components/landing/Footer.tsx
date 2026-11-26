@@ -33,9 +33,9 @@ export function Footer() {
         <div className="mt-20 flex flex-col items-center justify-between gap-6 border-t border-line pt-8 sm:flex-row">
           <BrandMark />
           <div className="eyebrow-sm flex flex-wrap items-center gap-5 text-ink-faint">
-            <span>Strands + Bedrock</span>
+            <span>Strands + Groq / Gemini</span>
             <span>Wear OS</span>
-            <span>Cedar · Step Functions · Polly</span>
+            <span>Cedar · Postgres · Edge TTS · Render</span>
             <span>Built for the demo floor</span>
           </div>
         </div>

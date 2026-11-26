@@ -28,7 +28,7 @@ const STEPS = [
   {
     n: "05",
     title: "Coordinate the right person",
-    body: "Suraksha asks Rahul first and waits for a real reply. He can't step out, so Suraksha asks Priya. Each ask is a Step Functions callback with a timeout — a calm update, not a panic alert.",
+    body: "Suraksha asks Rahul first and waits for a real reply. He can't step out, so Suraksha asks Priya. Each ask waits for a reply with a timeout — a calm update, not a panic alert.",
     tag: "Family Coordination · Tier 2",
     accent: true,
   },

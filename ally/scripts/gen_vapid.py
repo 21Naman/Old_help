@@ -1,4 +1,4 @@
-"""Generate a VAPID key pair for Web Push. Store the private key in SSM (SecureString), never in git.
+"""Generate a VAPID key pair for Web Push. Put both values in your env (Render dashboard or .env), never in git.
 
     python scripts/gen_vapid.py
 """

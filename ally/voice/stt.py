@@ -1,20 +1,17 @@
-"""Speech-to-text: Amazon Transcribe streaming.
+"""Speech-to-text entry point: Wispr Flow, then Groq Whisper (see voice.transcribe).
 
-Amma speaks Hindi, Indian English, or a mix of the two in one sentence. Transcribe's
-streaming language identification picks between hi-IN and en-IN per clip, with her
-profile language as the tiebreaker, so she never has to choose a language first.
+Amma speaks Hindi, Indian English, or a mix of the two in one sentence; the provider detects
+which, with her profile language as the tiebreaker, so she never has to choose a language first.
 
-There is no second provider and no silent fallback: if Transcribe is unavailable the
-API returns `stt_unavailable` and the tablet says so.
+There is no silent fallback to made-up text: if both providers fail the API returns
+`stt_unavailable` and the tablet says so.
 """
 
 from __future__ import annotations
 
-from botocore.exceptions import BotoCoreError, ClientError
-
 from core.errors import AllyError
 from core.log import log
-from voice.transcribe import Transcript, transcribe_wav
+from voice.transcribe import BadAudio, Transcript, transcribe_wav
 
 
 class SttError(AllyError):
@@ -25,6 +22,8 @@ class SttError(AllyError):
 async def transcribe(wav: bytes, preferred_language: str) -> Transcript:
     try:
         return await transcribe_wav(wav, preferred_language)
-    except (ClientError, BotoCoreError) as exc:
-        log("stt_error", provider="transcribe", error=repr(exc))
+    except BadAudio:
+        raise
+    except Exception as exc:
+        log("stt_error", error=repr(exc))
         raise SttError("I couldn't hear that clearly. Please try again.", detail=repr(exc)) from exc

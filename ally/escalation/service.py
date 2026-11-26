@@ -1,32 +1,22 @@
-"""Family escalation lifecycle around the Step Functions workflow.
+"""Family escalation lifecycle around the workflow in `escalation.machine`.
 
 start → (workflow asks children one by one, then the parent about the neighbour) → reply/stop.
 """
 
 from __future__ import annotations
 
-import json
-from functools import lru_cache
 from typing import Any, Literal
 
-import boto3
-from botocore.exceptions import ClientError
-
-from config import AWS_REGION, STATE_MACHINE_ARN
 from core import clock
-from core.errors import Conflict, Forbidden, NotConfigured, NotFound
+from core.errors import Conflict, Forbidden, NotFound
 from core.ids import new_id
 from core.log import log
 from core.names import display
+from escalation import machine
 from proactive import channel
 from store.repo import get_repo
 
 Decision = Literal["accept", "decline", "arrived", "confirm", "deny"]
-
-
-@lru_cache(maxsize=1)
-def _sfn() -> Any:
-    return boto3.client("stepfunctions", region_name=AWS_REGION)
 
 
 async def start(parent_id: str, alert: dict[str, Any], severity: str) -> dict[str, Any]:
@@ -49,20 +39,8 @@ async def start(parent_id: str, alert: dict[str, Any], severity: str) -> dict[st
     }
     repo.put_escalation(parent_id, esc)
     repo.update_alert(parent_id, alert, status="escalating", escalation_id=esc_id, tier=2)
-    if not STATE_MACHINE_ARN:
-        # Never leave the family un-notified because the workflow is missing (e.g. local dev).
-        log("escalation_workflow_missing", parent_id=parent_id, esc_id=esc_id)
-        from escalation import steps
-
-        await steps.notify_all({"parent_id": parent_id, "esc_id": esc_id, "reason": "workflow_unavailable"})
-        await steps.finish({"parent_id": parent_id, "esc_id": esc_id})
-        raise NotConfigured("Family workflow is not configured.", detail="ALLY_STATE_MACHINE_ARN missing")
-    resp = _sfn().start_execution(
-        stateMachineArn=STATE_MACHINE_ARN,
-        name=esc_id,
-        input=json.dumps({"parent_id": parent_id, "esc_id": esc_id}),
-    )
-    return repo.update_escalation(parent_id, esc_id, execution_arn=resp["executionArn"], status="running")
+    await machine.start(parent_id, esc_id)
+    return repo.get_escalation(parent_id, esc_id) or esc
 
 
 async def stop(parent_id: str, reason: str) -> dict[str, Any] | None:
@@ -72,15 +50,10 @@ async def stop(parent_id: str, reason: str) -> dict[str, Any] | None:
     if not esc_id:
         return None
     esc = repo.get_escalation(parent_id, esc_id) or {}
-    if esc.get("execution_arn"):
-        try:
-            _sfn().stop_execution(executionArn=esc["execution_arn"], cause=reason[:200])
-        except ClientError as err:
-            if err.response.get("Error", {}).get("Code") != "ExecutionDoesNotExist":
-                raise
+    repo.set_escalation_due(parent_id, esc_id, None)
     repo.append_escalation_event(parent_id, esc_id, {"event": "stopped", "reason": reason})
     repo.expire_pending_messages(parent_id, f"esc#{esc_id}#ask#")
-    repo.update_escalation(parent_id, esc_id, status="stopped", task_token=None, current_contact=None)
+    repo.update_escalation(parent_id, esc_id, status="stopped", awaiting=None, current_contact=None)
     profile = repo.get_profile(parent_id) or {}
     for member_id in esc.get("contacted", []):
         await channel.post(
@@ -113,20 +86,13 @@ async def reply(
             raise Forbidden("Only the person who said they'd go can mark arrival.")
         return await _arrived(parent_id, esc)
 
-    if esc.get("current_contact") != responder or esc.get("status") not in ("asking", "asking_parent"):
+    if esc.get("current_contact") != responder or esc.get("status") not in ("asking", "asking_parent", "asking_neighbour"):
         raise Conflict("Ally has already asked someone else.")
     version = int(esc.get("token_version", 0)) if token_version is None else token_version
-    before = repo.consume_escalation_token(parent_id, esc_id, version)
-    if not before or not before.get("task_token"):
+    if repo.consume_escalation_token(parent_id, esc_id, version) is None:
         raise Conflict("Ally has already asked someone else.")
-    try:
-        _sfn().send_task_success(taskToken=before["task_token"], output=json.dumps({"decision": decision}))
-    except ClientError as err:
-        code = err.response.get("Error", {}).get("Code")
-        if code in ("TaskTimedOut", "InvalidToken", "TaskDoesNotExist"):
-            raise Conflict("Ally has already asked someone else.") from err
-        raise
     repo.append_escalation_event(parent_id, esc_id, {"event": "reply", "by": responder, "decision": decision})
+    await machine.resume(parent_id, esc_id, decision)
     return repo.get_escalation(parent_id, esc_id) or esc
 
 
@@ -158,4 +124,4 @@ def view(parent_id: str, esc_id: str) -> dict[str, Any]:
     esc = get_repo().get_escalation(parent_id, esc_id, consistent=False)
     if not esc:
         raise NotFound("That request no longer exists.")
-    return {k: v for k, v in esc.items() if k not in ("task_token",)}
+    return {k: v for k, v in esc.items() if k not in ("machine",)}

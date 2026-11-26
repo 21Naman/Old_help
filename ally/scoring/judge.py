@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from agents.schemas import DeviationJudgment
-from llm.bedrock import structured
+from llm.client import structured
 from scoring.deviation import GateResult
 
 JUDGE_SYSTEM = """You judge whether an older parent's family should be involved today.
@@ -17,7 +17,7 @@ Conservative policy:
 - She says she is fine and nothing contradicts it: concerning=false, severity none/low.
 - Falls, chest pain, breathing trouble, confusion, inability to get up, or no response after Ally
   asked her: suggested_next = notify_child or escalate, severity high or critical.
-- The watch detecting a possible fall and no answer afterwards is critical: she may be unable to
+- The watch or phone detecting a possible fall and no answer afterwards is critical: she may be unable to
   reach the tablet. Never downgrade that because the signal might be a false alarm.
 - Being late or tired alone is at most low/medium.
 - Never invent symptoms or facts that are not in the input. Reasons are short and factual.
@@ -40,7 +40,7 @@ async def judge(
         "signals": gate.reasons,
         "her_words_today": utterance or None,
         "did_not_respond_after_ally_asked": no_response,
-        "watch_detected_possible_fall": after_fall,
+        "device_detected_possible_fall": after_fall,
         "recent_days": [
             {k: d.get(k) for k in ("date", "wake_at", "mood", "unwell_reported")} for d in (recent_days or [])[-5:]
         ],

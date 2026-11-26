@@ -4,11 +4,11 @@
 
 > Most days, Suraksha says nothing at all. That’s the point.
 
-Suraksha is a **hardware-first, agentic companion** for aging at home: Galaxy Watch + tablet voice + long-term memory + proactive care + consent-aware family escalation — built to **ship on AWS**.
+Suraksha is a **hardware-first, agentic companion** for aging at home: Galaxy Watch and/or an Android phone + tablet voice + long-term memory + proactive care + consent-aware family escalation — running entirely on **free services** (Render, Neon Postgres, Groq / Gemini, Wispr Flow, Edge TTS).
 
-Amma (72, Bengaluru) wears the watch and talks to Suraksha in Hindi or Hinglish. Rahul and Priya get a calm family view. They are notified only when something is actually wrong — and only the person who can show up is asked first.
+Amma (72, Bengaluru) wears the watch or keeps her phone on her, and talks to Suraksha in Hindi or Hinglish. Rahul and Priya get a calm family view. They are notified only when something is actually wrong — and only the person who can show up is asked first.
 
-**Build story + architecture diagram:** [`docs/suraksha-build-story.md`](docs/suraksha-build-story.md) · [`docs/suraksha-aws-architecture.png`](docs/suraksha-aws-architecture.png)  
+**Build story:** [`docs/suraksha-build-story.md`](docs/suraksha-build-story.md) (describes the original AWS build)  
 **API / agent runbook:** [`ally/README.md`](ally/README.md)
 
 ---
@@ -38,88 +38,72 @@ Suraksha is **not** an emergency service replacement. Family screens always surf
 | Capability | Detail |
 | --- | --- |
 | **Agentic voice companion** | Speak a task — reminders, check-ins, errands, health notes, consent. Tools run; it doesn’t only chat. |
-| **All-in-one memory** | DynamoDB single-table facts: day log, mood, alerts, reminders, consent, audit — not a disposable chat blob. |
-| **Hardware-first** | Galaxy Wear OS: wake, vitals, fall. Tablet for conversation. Put it on, talk. |
-| **Fall detection** | Watch signals open investigation / scripts; family chain only after policy and judgement. |
-| **Proactive care** | EventBridge every minute: due reminders, wake-window misses, investigation timeouts. |
+| **All-in-one memory** | Single-table facts in Postgres: day log, mood, alerts, reminders, consent, audit — not a disposable chat blob. |
+| **Hardware-first** | Galaxy Wear OS watch (wake, heart rate, fall) and/or the Android phone app (wake, steps, fall). Tablet for conversation. |
+| **Fall detection** | Watch or phone signals (deduped if both fire) open investigation / scripts; family chain only after policy and judgement. |
+| **Proactive care** | A sweep every minute (external cron or in-process): due reminders, wake-window misses, investigation timeouts. |
 | **Ask her first** | Missed wake or worrying signal → Suraksha checks in with Amma before looping family. |
 | **Consent that blocks tools** | Spoken privacy rules → Cedar templates → `ConsentGuard` on every tool call; audit she can read. |
 | **Evidence-only family Q&A** | “Did she sleep okay?” → answers only from tool-returned records, or not sure / private. |
-| **Family escalation** | Step Functions: Rahul → timeout → Priya → ask about neighbour → neighbour if allowed → failsafe notify-all. |
+| **Family escalation** | Database-driven workflow: Rahul → timeout → Priya → ask about neighbour → neighbour if allowed → failsafe notify-all. |
 | **Quiet by design** | Most days: no noise. Engagement is not the goal. |
-| **Explore world (demo)** | 3D wardstone / gallery experience for storytelling and AWS gallery beats. |
+| **Explore world (demo)** | 3D wardstone / gallery experience for storytelling. |
 
 ### Example moments
 
-| Moment | What happens | AWS |
+| Moment | What happens | Runs on |
 | --- | --- | --- |
-| First movement of the day | Watch posts `wake`; short morning check-in; “after I wake” reminders schedule | Lambda · DynamoDB · Bedrock · Polly |
-| Amma speaks a task | Transcribe → companion agent + tools → typed reply → Polly speaks | Transcribe · Bedrock · Polly |
-| “Don’t tell Priya about my health” | Fixed Cedar `forbid` template; she confirms; tools blocked thereafter | Cedar · DynamoDB audit |
-| Not up by usual time | Worker opens investigation; asks Amma first | EventBridge · Lambda |
-| Fall / unwell / no reply | Gate → Bedrock judge → tier policy in code | Bedrock · DynamoDB |
-| Family needed | Step Functions callbacks + Web Push accept/decline | Step Functions · Secrets Manager |
-| Family asks a question | Family Q&A agent; Cedar principal = asker | Bedrock · Cedar · DynamoDB |
+| First movement of the day | Watch or phone posts `wake`; short morning check-in; “after I wake” reminders schedule | FastAPI · Postgres · Groq · Edge TTS |
+| Amma speaks a task | Wispr Flow → companion agent + tools → typed reply → Edge TTS speaks | Wispr Flow · Groq · Edge TTS |
+| “Don’t tell Priya about my health” | Fixed Cedar `forbid` template; she confirms; tools blocked thereafter | Cedar · Postgres audit |
+| Not up by usual time | Sweep opens investigation; asks Amma first | cron-job.org → `/ally/cron/sweep` |
+| Fall / unwell / no reply | Gate → LLM judge → tier policy in code | Groq (Gemini fallback) |
+| Family needed | Workflow asks each person in turn; Web Push accept/decline | Postgres · Web Push (VAPID) |
+| Family asks a question | Family Q&A agent; Cedar principal = asker | Groq · Cedar · Postgres |
 
 ---
 
-## Architecture (AWS-first)
-
-![Suraksha on AWS](docs/suraksha-aws-architecture.png)
+## Architecture
 
 ```
-Wear OS / Parent tablet / Family web
-        │
-   AWS Amplify (Next.js) ── Amazon Cognito (JWT)
-        │
-   Amazon API Gateway HTTP API
-        │  JWT for people · device key for watch
-        ▼
-   AWS Lambda (containers via Amazon ECR)
-        ├─ API  — FastAPI · companion · scripts · handoff
-        ├─ Worker — proactive sweep
-        └─ Escalation — Step Functions tasks
-             │
-             ├─ Amazon Bedrock (Nova 2 Lite) — agents + judge
-             ├─ Amazon Transcribe — streaming STT
-             ├─ Amazon Polly — neural TTS
-             ├─ Cedar ConsentGuard — before every tool
-             └─ Amazon DynamoDB — single-table memory
-   Amazon EventBridge (1 min) → Worker
-   AWS Step Functions → family chain (waitForTaskToken)
-   AWS Secrets Manager · KMS · CloudWatch · CloudTrail
+Galaxy Watch (Wear OS)   Android phone app   Parent tablet / Family web (Render static site)
+        │                       │                         │  JWT (Ally-issued)
+        └── device key ─────────┴──────────┬──────────────┘
+                                           ▼
+                        Ally API — FastAPI on Render (Docker, free)
+                          ├─ companion · family Q&A · judge · morning (Strands agents)
+                          ├─ Cedar ConsentGuard — before every tool
+                          ├─ escalation workflow (state on the escalation row)
+                          └─ /ally/cron/sweep ◄── cron-job.org, every minute
+                                           │
+        ┌───────────────┬──────────────────┼──────────────────┬────────────────┐
+   Neon Postgres   Groq (Llama 3.3)    Wispr Flow STT     Edge neural TTS    Web Push
+   single table    → Gemini fallback   → Groq Whisper
 ```
 
 **Design rules**
 
-- No silent LLM fallbacks — Bedrock failure → `llm_unavailable` in the UI.
+- No silent LLM fallbacks to fake text — if both providers fail the UI shows `llm_unavailable`.
 - The model decides language and judgement; **code** decides actions.
 - Safety cannot be switched off; conversations are never shared as a feed.
 - History before today may be simulated and labelled; **today is live**.
 
 ---
 
-## AWS services
+## Services (all free tiers)
 
-| Layer | Services |
-| --- | --- |
-| Edge | Galaxy Wear OS · parent/family web |
-| Presentation | **AWS Amplify Hosting** |
-| Identity | **Amazon Cognito** (parent / family groups, custom attributes) |
-| Edge API | **Amazon API Gateway** HTTP API (JWT + public device routes, throttling) |
-| Compute | **AWS Lambda** (API, worker, escalation) · **Amazon ECR** |
-| IaC | **AWS CDK** → **AWS CloudFormation** |
-| Agents | **Amazon Bedrock** (Nova 2 Lite inference profile) · Strands-style tools |
-| Voice | **Amazon Transcribe** (STT) · **Amazon Polly** (TTS) |
-| Memory | **Amazon DynamoDB** (single table, GSI for due reminders, PITR, TTL) |
-| Policy | **Cedar** ConsentGuard + DynamoDB audit |
-| Secrets | **AWS Secrets Manager** (`ally/runtime`) · **AWS KMS** |
-| Proactive | **Amazon EventBridge** (rate: 1 minute) |
-| Escalation | **AWS Step Functions** Standard (`waitForTaskToken`) · Web Push (VAPID) |
-| Ops | **Amazon CloudWatch** (logs, metrics, alarms, dashboard) · **AWS CloudTrail** |
-| Access | **AWS IAM** least-privilege roles per function |
-
-Deep dive: [`docs/suraksha-build-story.md`](docs/suraksha-build-story.md).
+| Need | Service | Replaces |
+| --- | --- | --- |
+| API hosting | **Render** web service (Docker) | Lambda · API Gateway · ECR |
+| Web hosting | **Render** static site | Amplify Hosting |
+| Database | **Neon** Postgres (SQLite locally) | DynamoDB |
+| LLM | **Groq** `llama-3.3-70b-versatile`, **Gemini** `2.5-flash` fallback (via LiteLLM) | Bedrock |
+| Speech-to-text | **Wispr Flow**, Groq Whisper fallback | Transcribe |
+| Text-to-speech | **Edge neural voices** (`edge-tts`) | Polly |
+| Scheduler | **cron-job.org** → `POST /ally/cron/sweep` | EventBridge |
+| Escalation workflow | `ally/escalation/machine.py` | Step Functions |
+| Sign-in | Ally-issued JWT (bcrypt passwords) | Cognito |
+| Secrets | Render environment variables | Secrets Manager |
 
 ---
 
@@ -132,7 +116,7 @@ Deep dive: [`docs/suraksha-build-story.md`](docs/suraksha-build-story.md).
 | `/parent/privacy` | Amma | What was shared; consent / audit |
 | `/home` | Family | Calm family dashboard |
 | `/command` | Family | Timeline / command center |
-| `/family/respond/[id]` | Family | Push landing — accept / decline escalation |
+| `/family/respond` | Family | Push landing — accept / decline escalation |
 | `/guard` | Nearby help | Guard handset surface |
 | `/explore` | Demo | 3D wardstone / gallery world |
 
@@ -142,29 +126,14 @@ Deep dive: [`docs/suraksha-build-story.md`](docs/suraksha-build-story.md).
 
 ```
 ally/          Agentic API — agents, policy (Cedar), scoring, store, escalation,
-               proactive, voice, Lambda handlers, tests
-web/           Next.js — landing, parent, family, command, guard, explore
-infra/         AWS CDK — DynamoDB, Cognito, API Gateway, Lambda, EventBridge,
-               Step Functions, IAM, CloudWatch
-wear-os/       Kotlin · Compose — watch UI, fall / wake / vitals, AudioBridge
-docs/          Build story + architecture diagram
-scripts/       Deploy / secrets helpers
-backend/       Legacy Rakshak plumbing (optional reference; not the Suraksha path)
+               proactive, voice, tests
+web/           Next.js (static export) — landing, parent, family, command, guard, explore
+wear-os/       Kotlin · Compose — watch UI, fall / wake / vitals
+phone/         Kotlin · Compose — Android phone app: fall / wake / steps (foreground service)
+render.yaml    Render Blueprint for the API and the web app
+docs/          Build story
+backend/       Legacy Rakshak plumbing (not deployed; reference only)
 ```
-
----
-
-## Deployed (Ship it)
-
-| Piece | Where |
-| --- | --- |
-| Web | Amplify Hosting (auto-build on `main`) |
-| API | API Gateway → Lambda containers |
-| Auth | Cognito user pool (demo users: `amma`, `rahul`, `priya`, …) |
-| Secrets | Secrets Manager bundle `ally/runtime` |
-| Data | DynamoDB table `Ally` (single-table memory) |
-
-Exact URLs and pool IDs: see [`ally/README.md`](ally/README.md) (environment-specific).
 
 ---
 
@@ -172,67 +141,78 @@ Exact URLs and pool IDs: see [`ally/README.md`](ally/README.md) (environment-spe
 
 ### Prerequisites
 
-- Node.js 20+
-- Python 3.11+
-- AWS credentials with access to DynamoDB / Bedrock (for live agent turns)
-- Docker (for image builds / deploy)
-- Optional: Android Studio + Galaxy Watch 4+ for Wear OS
+- Python 3.11+ and Node.js 20+
+- Free API keys: Groq (and optionally Gemini, Wispr Flow) for live AI turns — everything else runs without keys
+- Optional: Android Studio / JDK 17 + Android SDK for the watch and phone apps
 
 ### Agent API (`ally/` · port `8002`)
 
-```powershell
+```bash
 cd ally
-python -m venv .venv
-.venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-copy .env.example .env
-python -m pytest -q
-python scripts\smoke_bedrock.py
+cp .env.example .env               # fill GROQ_API_KEY and the secrets; DATABASE_URL empty = SQLite
+python -m pytest -q                # offline tests, no network
+python scripts/seed.py --users --password 'pick-a-password'
+python scripts/smoke_llm.py        # live LLM check: every schema, exits non-zero on failure
 uvicorn app:app --reload --port 8002
 ```
 
+With `ALLY_INPROC_SCHEDULER=1` the per-minute sweep runs inside the API, so reminders, wake checks
+and escalation timeouts work locally without a cron.
+
 ### Web (`web/` · port `3000`)
 
-```powershell
+```bash
 cd web
-copy .env.local.example .env.local
+cp .env.local.example .env.local
 npm install
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) · `/parent` · `/home` · `/command`.
 
-### Deploy to AWS
-
-```powershell
-.\scripts\deploy.ps1 -SeedPassword "<family password>"
-```
-
-Runs tests, writes the Secrets Manager bundle, deploys the CDK stack, seeds the family, prints frontend settings. Demo timings (real parameters, not fakes):
-
-```powershell
-.\scripts\deploy.ps1 -SeedPassword "<password>" -c escalationContactTimeout=60 -c investigationWindowMin=2
-```
-
 Reset a demo day (keeps profile, family, consent, audit, labelled history):
 
-```powershell
+```bash
 python ally/scripts/reset_day.py --yes
 ```
 
-### Wear OS
+### Watch and phone
 
-See [`wear-os/README.md`](wear-os/README.md). Watch posts to the API watch route with the device key from Secrets Manager. Sensor path (fall / wake / vitals) is shown in the submission video when a physical watch is required.
+Both post the same events to `POST /ally/watch` (or `/ally/device`) with header `X-Ally-Device-Key`;
+the phone adds `"source": "phone"`. Wear both or either — the server records one wake per day and one
+fall per 10-minute window.
+
+- Watch: [`wear-os/README.md`](wear-os/README.md) — set `ALLY_API` and the device key in `local.properties`.
+- Phone: [`phone/README.md`](phone/README.md) — API URL and device key are entered in the app's settings.
 
 ---
 
+## Deploy (Render, free)
 
+1. **Neon:** create a free project and copy the connection string.
+2. **Keys:** Groq API key, Gemini API key (Google AI Studio), Wispr Flow API key (optional).
+3. **VAPID keys:** `python ally/scripts/gen_vapid.py`.
+4. **Render:** *New → Blueprint* on this repo. It reads [`render.yaml`](render.yaml) and creates
+   `suraksha-api` and `suraksha-web`. Fill the prompted values: `DATABASE_URL`, the API keys, VAPID keys,
+   `ALLY_SEED_PASSWORD`, `PUBLIC_WEB_URL` / `CORS_ORIGINS` (the web URL), and on the web service
+   `NEXT_PUBLIC_SURAKSHA_API_URL` (the API URL).
+5. **Seed:** from the API service's Shell tab, run `python scripts/seed.py --users`.
+6. **Scheduler:** on [cron-job.org](https://cron-job.org) add a job every minute:
+   `POST https://<api>.onrender.com/ally/cron/sweep` with header `X-Cron-Secret: <ALLY_CRON_SECRET>`.
+   This also keeps the free instance from sleeping.
+7. **Devices:** give the watch and phone the API URL and `ALLY_DEVICE_KEY` (or per-device keys).
+
+---
 
 ## Limitations
 
 - Not a medical device, EMR, or replacement for emergency services.
 - iOS web push may require home-screen install; respond page covers action buttons.
-- New AWS accounts may be limited to Lambda concurrency 10 (provisioned concurrency deferred until quota increase).
-- Physical watch sensors cannot be fully emulated in the browser — wearable flow is in the submission video.
+- Render's free web service sleeps after 15 idle minutes; the every-minute cron keeps it awake. If the cron stops, the first request takes ~30–60 s.
+- Free LLM tiers are rate-limited (Groq ~30 requests/minute) — ample for one family.
+- Phone-only users get no heart rate or SpO₂; the phone is also less reliable for falls when it isn't on her.
+- Physical watch and phone sensors cannot be emulated in the browser; simulate events with `curl` against `/ally/watch`.
 
 ---

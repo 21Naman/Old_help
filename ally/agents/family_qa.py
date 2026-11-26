@@ -15,7 +15,7 @@ from strands import ToolContext, tool
 
 from agents.schemas import EvidenceAnswer
 from core import clock
-from llm.bedrock import structured
+from llm.client import structured
 from policy.hook import ConsentGuard
 from store.repo import get_repo
 

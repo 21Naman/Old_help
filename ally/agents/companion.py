@@ -10,7 +10,7 @@ from strands import ToolContext, tool
 
 from agents.schemas import CompanionReply
 from core import clock
-from llm.bedrock import structured
+from llm.client import structured
 from policy import consent
 from policy.hook import ConsentGuard
 from proactive import channel, reminders

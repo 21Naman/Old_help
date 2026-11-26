@@ -1,6 +1,6 @@
-import { redirect } from "next/navigation";
+import { ClientRedirect } from "@/components/ClientRedirect";
 
-/** Convenience: /family → /family/live (binds to the current live session). */
-export default function FamilyIndexPage() {
-  redirect("/family/live");
+/** Legacy link — the family experience now lives on /home. */
+export default function FamilyIndexRedirect() {
+  return <ClientRedirect to="/home" />;
 }

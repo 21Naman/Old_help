@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import { ClientRedirect } from "@/components/ClientRedirect";
 
 export default function CheckinRedirect() {
-  redirect("/parent");
+  return <ClientRedirect to="/parent" />;
 }

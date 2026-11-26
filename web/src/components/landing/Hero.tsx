@@ -70,7 +70,7 @@ export function Hero() {
           </motion.div>
 
           <motion.div className="hero-tags" {...rise(0.26)}>
-            {["Strands", "Bedrock", "Cedar", "Wear OS"].map((t) => (
+            {["Strands", "Groq + Gemini", "Cedar", "Wear OS"].map((t) => (
               <span key={t} className="hero-tag">{t}</span>
             ))}
           </motion.div>

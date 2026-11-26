@@ -15,28 +15,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from boto3.dynamodb.conditions import Key  # noqa: E402
-
 from config import PARENT_ID  # noqa: E402
 from core import clock  # noqa: E402
-from store.repo import _pk, get_repo  # noqa: E402
+from store.repo import get_repo  # noqa: E402
 
 CLEAR_PREFIXES = ("ALERT#", "INVESTIGATION#", "ESC#", "ESC_ACTIVE", "MSG#", "SIGNAL#", "TURN#", "DEDUPE#")
 
 
 def main(parent_id: str, apply: bool) -> None:
     repo = get_repo()
-    resp = repo.table.query(KeyConditionExpression=Key("pk").eq(_pk(parent_id)))
-    doomed = [i["sk"] for i in resp.get("Items", []) if i["sk"].startswith(CLEAR_PREFIXES)]
+    doomed = [sk for sk in repo.list_keys(parent_id) if sk.startswith(CLEAR_PREFIXES)]
     today = repo.get_day(parent_id, clock.local_date())
     print(f"{len(doomed)} operational items; today = { {k: today.get(k) for k in ('wake_at', 'checkin_at', 'im_okay_at')} }")
     if not apply:
         print("dry run — pass --yes to clear")
         return
-    with repo.table.batch_writer() as batch:
-        for sk in doomed:
-            batch.delete_item(Key={"pk": _pk(parent_id), "sk": sk})
-    repo.table.delete_item(Key={"pk": _pk(parent_id), "sk": f"DAY#{clock.local_date()}"})
+    repo.delete_keys(parent_id, [*doomed, f"DAY#{clock.local_date()}"])
     print("cleared; profile, family, consent rules, audit log and simulated history kept")
 
 

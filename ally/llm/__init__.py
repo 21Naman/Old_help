@@ -1,1 +1,1 @@
-"""Bedrock (Nova 2 Lite) through Strands. Every call is typed; failures raise LLMError."""
+"""The model, through Strands + LiteLLM (Groq, Gemini, Ollama, …). Every call is typed; failures raise LLMError."""
