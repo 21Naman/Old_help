@@ -74,6 +74,7 @@ async def reply(
     responder: str,
     decision: Decision,
     token_version: int | None = None,
+    eta_min: int | None = None,
 ) -> dict[str, Any]:
     """A child (accept/decline/arrived) or the parent (confirm/deny neighbour) answers."""
     repo = get_repo()
@@ -92,6 +93,7 @@ async def reply(
         repo.append_escalation_event(parent_id, esc_id, {"event": "reply", "by": responder, "decision": decision, "parallel": True})
         if decision == "accept":
             await machine.parallel_accept(parent_id, esc_id)
+            _set_eta(parent_id, esc_id, eta_min)
         else:
             repo.update_escalation(parent_id, esc_id, parallel=[p for p in esc.get("parallel", []) if p != responder])
         return repo.get_escalation(parent_id, esc_id) or esc
@@ -103,7 +105,19 @@ async def reply(
         raise Conflict("Ally has already asked someone else.")
     repo.append_escalation_event(parent_id, esc_id, {"event": "reply", "by": responder, "decision": decision})
     await machine.resume(parent_id, esc_id, decision)
+    if decision == "accept":
+        _set_eta(parent_id, esc_id, eta_min)
     return repo.get_escalation(parent_id, esc_id) or esc
+
+
+def _set_eta(parent_id: str, esc_id: str, eta_min: int | None) -> None:
+    """The helper's own estimate, used by the stay loop. Never invented: no minutes, no ETA."""
+    if eta_min and eta_min > 0:
+        from datetime import timedelta
+
+        get_repo().update_escalation(
+            parent_id, esc_id, eta_min=int(eta_min), eta_at=clock.iso(clock.now() + timedelta(minutes=int(eta_min)))
+        )
 
 
 async def _arrived(parent_id: str, esc: dict[str, Any]) -> dict[str, Any]:

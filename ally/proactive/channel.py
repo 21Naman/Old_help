@@ -22,6 +22,7 @@ PUSH_TITLES = {
     "all_clear": "Amma is okay",
     "peela_call": "Please give Amma a call",
     "peela_said": "Suraksha",
+    "stay": "Suraksha",
 }
 
 

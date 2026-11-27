@@ -133,6 +133,7 @@ class PeelaReplyIn(BaseModel):
 
 class EscalationReplyIn(BaseModel):
     decision: Literal["accept", "decline", "arrived"]
+    eta_min: int | None = Field(default=None, ge=1, le=240)
 
 
 class TokenReplyIn(BaseModel):
@@ -481,7 +482,7 @@ def get_escalation(esc_id: str, identity: Identity = Depends(current_identity)) 
 @api.post("/escalations/{esc_id}/reply")
 async def escalation_reply(esc_id: str, body: EscalationReplyIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     require_family(identity)
-    esc = await escalation.reply(identity.parent_id, esc_id, responder=identity.member_id, decision=body.decision)
+    esc = await escalation.reply(identity.parent_id, esc_id, responder=identity.member_id, decision=body.decision, eta_min=body.eta_min)
     return {k: v for k, v in esc.items() if k != "machine"}
 
 

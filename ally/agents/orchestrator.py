@@ -361,6 +361,68 @@ async def _peela_to_laal(parent_id: str, alert: dict[str, Any], *, reason: str) 
     return {"status": "escalating", **(await _escalate(parent_id, alert, "critical"))}
 
 
+_STAY_ACTIVE = ("starting", "running", "asking", "asking_parent", "asking_neighbour", "accepted")
+STILL_DOWN_HPA = 0.05  # wrist this much lower than her pre-fall reading = still on the floor
+ETA_GRACE_MIN = 15
+
+
+def still_on_floor(parent_id: str, now: Any) -> bool | None:
+    """From the watch's last minute of readings. None when there is no recent data (never guessed)."""
+    signals = get_repo().signals_between(parent_id, now - timedelta(minutes=30), now)
+    ref = next((x for x in reversed(signals) if x.get("kind") == "getup_ref" and x.get("p_ref_hpa") is not None), None)
+    recent = [x for x in signals if x.get("kind") == "getup_sample" and x.get("p_hpa") is not None
+              and clock.parse_iso(x["at"]) >= now - timedelta(seconds=60)]
+    if not ref or not recent:
+        return None
+    return float(recent[-1]["p_hpa"]) - float(ref["p_ref_hpa"]) > STILL_DOWN_HPA
+
+
+async def stay_ticks(now: Any) -> int:
+    """Stay with her (bible v5 L7): every minute while help is on the way, tell her where it stands.
+
+    Status lines come from the escalation record only (No False Comfort): nobody is "coming" unless they
+    accepted, and the minutes are the helper's own estimate.
+    """
+    repo = get_repo()
+    ticks = 0
+    for parent_id in _parent_ids():
+        esc_id = repo.active_escalation_id(parent_id)
+        esc = repo.get_escalation(parent_id, esc_id) if esc_id else None
+        if not esc or esc.get("status") not in _STAY_ACTIVE:
+            continue
+        profile = _profile(parent_id)
+        hi = profile.get("language") == "hi-IN"
+        responder = repo.get_member(parent_id, esc.get("responder") or "") if esc.get("status") == "accepted" else None
+        eta_at = esc.get("eta_at")
+        mins = max(1, round((clock.parse_iso(eta_at) - now).total_seconds() / 60)) if eta_at else None
+        if responder:
+            who = display(responder, "hi-IN" if hi else "en-IN", "")
+            if hi:
+                body = f"{who} आ रहे हैं" + (f", लगभग {mins} मिनट" if mins else "") + "। मैं यहीं हूँ।"
+            else:
+                body = f"{who} is on the way" + (f", about {mins} minutes" if mins else "") + ". I'm right here."
+        else:
+            body = "मैं यहीं हूँ, मदद बुला रही हूँ।" if hi else "I'm right here. I'm getting help."
+        await channel.post(parent_id, audience="parent", kind="stay", body=body, related_id=f"stay#{esc['id']}#{clock.iso(now)[:16]}")
+
+        down = still_on_floor(parent_id, now)
+        if down is not None and down != esc.get("still_on_floor"):
+            repo.update_escalation(parent_id, esc["id"], still_on_floor=down)
+
+        if responder and eta_at and not esc.get("overdue_asked") and now > clock.parse_iso(eta_at) + timedelta(minutes=ETA_GRACE_MIN):
+            await channel.post(
+                parent_id,
+                audience=responder["id"],
+                kind="escalation_update",
+                body=f"Are you still on your way to {profile['name']}? Tap Arrived when you're with her.",
+                related_id=f"stay#{esc['id']}#overdue",
+            )
+            repo.update_escalation(parent_id, esc["id"], overdue_asked=True)
+            log("stay_eta_overdue", parent_id=parent_id, esc_id=esc["id"], responder=responder["id"])
+        ticks += 1
+    return ticks
+
+
 async def peela_timeouts(now: Any) -> int:
     count = 0
     for parent_id in _parent_ids():
@@ -422,6 +484,10 @@ async def sweep() -> dict[str, Any]:
             out["investigations"] += 1
         except Exception as exc:
             log("investigation_timeout_failed", parent_id=inv["parent_id"], error=repr(exc))
+    try:
+        out["stay"] = await stay_ticks(now)
+    except Exception as exc:
+        log("stay_tick_failed", error=repr(exc))
     try:
         out["peela_timeouts"] = await peela_timeouts(now)
     except Exception as exc:
