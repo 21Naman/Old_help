@@ -35,3 +35,11 @@ when {
   context.parent_confirmed ||
   (context.escalation_timed_out && context.severity == "critical")
 };
+
+@id("neighbour-first-for-falls")
+@desc("If Amma agreed in advance, her neighbour is asked at the same time as her nearest child when she may have fallen.")
+permit(principal is Neighbour, action == Action::"contact_neighbour", resource == Topic::"safety")
+when {
+  context has fall_preconsent && context.fall_preconsent == true &&
+  context has reason && context.reason == "fall"
+};

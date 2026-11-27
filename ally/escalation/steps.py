@@ -25,9 +25,65 @@ async def init(event: dict[str, Any]) -> dict[str, Any]:
     repo = get_repo()
     parent_id, esc_id = event["parent_id"], event["esc_id"]
     members = repo.list_members(parent_id)
-    children = [m["id"] for m in members if m.get("role") == "child"]
-    repo.append_escalation_event(parent_id, esc_id, {"event": "plan", "children": children})
-    return {"parent_id": parent_id, "esc_id": esc_id, "contacts": children, "index": 0, "count": len(children)}
+    esc = repo.get_escalation(parent_id, esc_id) or {}
+    alert = repo.get_alert(parent_id, esc.get("alert_id", "")) or {}
+    profile = repo.get_profile(parent_id) or {}
+    is_fall = alert.get("kind") == "fall"
+    kids = [m for m in members if m.get("role") == "child"]
+    if is_fall:
+        # For a fall, the child who can actually reach her goes first (same city), then family order.
+        city = (profile.get("city") or "").strip().lower()
+        kids.sort(key=lambda m: (not (city and (m.get("city") or "").strip().lower() == city), m.get("order", 99)))
+    children = [m["id"] for m in kids]
+    neighbour = profile.get("fall_preconsent_neighbour") if is_fall else None
+    repo.append_escalation_event(parent_id, esc_id, {"event": "plan", "children": children, "parallel_neighbour": neighbour})
+    return {
+        "parent_id": parent_id, "esc_id": esc_id, "contacts": children, "index": 0, "count": len(children),
+        "parallel_neighbour": neighbour,
+    }
+
+
+async def ask_neighbour_in_parallel(event: dict[str, Any]) -> dict[str, Any]:
+    """Fall + Amma's prior consent: ask the neighbour now, alongside the first child (bible v5 L6)."""
+    repo = get_repo()
+    parent_id, esc_id, neighbour_id = event["parent_id"], event["esc_id"], event["neighbour_id"]
+    esc = repo.get_escalation(parent_id, esc_id) or {}
+    neighbour = repo.get_member(parent_id, neighbour_id)
+    profile = repo.get_profile(parent_id) or {}
+    name = profile.get("name", "Amma")
+    if not neighbour:
+        return {"asked": False}
+    decision = authorize(
+        parent_id,
+        principal=("Neighbour", neighbour_id),
+        action="contact_neighbour",
+        topic="safety",
+        requested_by="Ally::coordinator",
+        context=_ctx(esc, parent_confirmed=False, escalation_timed_out=False, fall_preconsent=True, reason="fall"),
+        summary=f"Ask {neighbour['name']} to check on {name} (agreed in advance for falls)",
+    )
+    if not decision.allowed:
+        return {"asked": False}
+    await channel.post(
+        parent_id,
+        audience=neighbour_id,
+        kind="escalation_ask",
+        title=f"Could you check on {name}?",
+        body=f"{name} may have fallen and can't get up. You're closest. Can you go over now?",
+        related_id=f"esc#{esc_id}#ask#{neighbour_id}#parallel",
+        data={"esc_id": esc_id},
+        push_extra={
+            "esc_id": esc_id,
+            "reply_token": tokens.sign(parent_id, esc_id, neighbour_id, -1),
+            "actions": ["accept", "decline"],
+        },
+    )
+    repo.update_escalation(
+        parent_id, esc_id, neighbour_id=neighbour_id, parallel=[neighbour_id],
+        contacted=sorted({*esc.get("contacted", []), neighbour_id}),
+    )
+    repo.append_escalation_event(parent_id, esc_id, {"event": "asked_parallel", "member": neighbour_id})
+    return {"asked": True}
 
 
 async def ask_contact(event: dict[str, Any]) -> dict[str, Any]:

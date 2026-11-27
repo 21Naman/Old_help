@@ -86,6 +86,16 @@ async def reply(
             raise Forbidden("Only the person who said they'd go can mark arrival.")
         return await _arrived(parent_id, esc)
 
+    if responder in (esc.get("parallel") or []) and esc.get("current_contact") != responder:
+        if esc.get("status") not in ("asking", "asking_parent", "asking_neighbour", "running"):
+            raise Conflict("Someone else is already going.")
+        repo.append_escalation_event(parent_id, esc_id, {"event": "reply", "by": responder, "decision": decision, "parallel": True})
+        if decision == "accept":
+            await machine.parallel_accept(parent_id, esc_id)
+        else:
+            repo.update_escalation(parent_id, esc_id, parallel=[p for p in esc.get("parallel", []) if p != responder])
+        return repo.get_escalation(parent_id, esc_id) or esc
+
     if esc.get("current_contact") != responder or esc.get("status") not in ("asking", "asking_parent", "asking_neighbour"):
         raise Conflict("Ally has already asked someone else.")
     version = int(esc.get("token_version", 0)) if token_version is None else token_version

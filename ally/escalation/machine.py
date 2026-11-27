@@ -38,6 +38,8 @@ async def start(parent_id: str, esc_id: str) -> None:
         plan = await steps.init(_ids(parent_id, esc_id))
         machine = {"contacts": plan["contacts"], "index": 0, "count": plan["count"], "state": "init"}
         get_repo().update_escalation(parent_id, esc_id, status="running", machine=machine)
+        if plan.get("parallel_neighbour"):
+            await steps.ask_neighbour_in_parallel({**_ids(parent_id, esc_id), "neighbour_id": plan["parallel_neighbour"]})
         await _ask_next(parent_id, esc_id, machine)
     except Exception as exc:  # noqa: BLE001 — any failure must still reach the family
         log("escalation_machine_error", parent_id=parent_id, esc_id=esc_id, error=repr(exc))
@@ -100,6 +102,19 @@ async def resume(parent_id: str, esc_id: str, decision: str) -> None:
     except Exception as exc:  # noqa: BLE001
         log("escalation_machine_error", parent_id=parent_id, esc_id=esc_id, error=repr(exc))
         await steps.failsafe(_ids(parent_id, esc_id))
+
+
+async def parallel_accept(parent_id: str, esc_id: str) -> None:
+    """The neighbour asked in parallel said yes first: they're the one coming, the chain stops."""
+    repo = get_repo()
+    esc = repo.get_escalation(parent_id, esc_id) or {}
+    repo.update_escalation(
+        parent_id, esc_id, machine={**(esc.get("machine") or {}), "state": "done"},
+        awaiting=None, token_version=int(esc.get("token_version", 0)) + 1,
+    )
+    repo.set_escalation_due(parent_id, esc_id, None)
+    repo.expire_pending_messages(parent_id, f"esc#{esc_id}#ask#")
+    await steps.neighbour_accepted(_ids(parent_id, esc_id))
 
 
 async def sweep_timeouts() -> int:
