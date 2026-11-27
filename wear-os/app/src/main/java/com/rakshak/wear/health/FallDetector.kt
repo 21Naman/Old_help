@@ -19,7 +19,10 @@ import kotlin.math.sqrt
  */
 class FallDetector(
     context: Context,
+    /** A body fall: free-fall followed by an impact. */
     private val onFallDetected: () -> Unit,
+    /** A hard knock after stillness (watch put down or dropped). Reported as `drop` -> GREY, never a fall. */
+    private val onDropDetected: () -> Unit = {},
 ) : SensorEventListener {
 
     private val sensorManager =
@@ -107,8 +110,9 @@ class FallDetector(
                 stillSince > 0L && (now - stillSince) >= STILL_BEFORE_IMPACT_MS
             val notDoubleBounce = now - lastImpactAt > 400L
             if (wasStillLongEnough && notDoubleBounce) {
-                Log.i(tag, "Hard impact after stillness: ${"%.1f".format(mag)} m/s²")
-                fire(now)
+                // Bible v5 fix #2: this pattern is the watch being put down or dropped, not a person.
+                Log.i(tag, "Hard impact after stillness (drop): ${"%.1f".format(mag)} m/s²")
+                onDropDetected()
             }
             stillSince = 0L
             lastImpactAt = now

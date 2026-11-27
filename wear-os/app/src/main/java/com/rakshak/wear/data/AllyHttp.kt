@@ -33,6 +33,13 @@ class AllyHttp(
 
     fun imOkay(): Boolean = postWatch("im_okay")
 
+    /** Any device event with extra fields (getup_ref, getup_sample, drop). Null values are left out. */
+    fun postEvent(kind: String, fields: Map<String, Any?>): Boolean {
+        val json = JSONObject().put("kind", kind)
+        for ((k, v) in fields) if (v != null) json.put(k, v)
+        return post("/ally/watch", json.toString())
+    }
+
     private fun post(path: String, json: String): Boolean {
         repeat(2) { attempt ->
             try {

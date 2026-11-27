@@ -10,6 +10,7 @@ import com.rakshak.wear.data.EmergencyInbound
 import com.rakshak.wear.data.OrchestratorClient
 import com.rakshak.wear.data.WatchInbound
 import com.rakshak.wear.health.FallDetector
+import com.rakshak.wear.health.GetupStreamer
 import com.rakshak.wear.health.VitalsCollector
 import com.rakshak.wear.health.WakeDetector
 import com.rakshak.wear.health.WatchVitals
@@ -64,9 +65,14 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    private val fallDetector = FallDetector(app) {
-        viewModelScope.launch { onFallDetected() }
-    }
+    private val getup = GetupStreamer(app, allyHttp, viewModelScope)
+    private val fallDetector = FallDetector(
+        app,
+        onFallDetected = { viewModelScope.launch { onFallDetected() } },
+        onDropDetected = {
+            viewModelScope.launch(Dispatchers.IO) { allyHttp.postEvent("drop", mapOf("dropped" to true)) }
+        },
+    )
     private val wakeDetector = WakeDetector(app) {
         viewModelScope.launch(Dispatchers.IO) {
             allyHttp.postWatch("wake")
@@ -92,6 +98,7 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
     fun connect() {
         care.connect()
         fallDetector.start()
+        getup.start()
         wakeDetector.start()
 
         if (!started.compareAndSet(false, true)) return
@@ -225,6 +232,7 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
         vitalsJob?.cancel()
         vitalsJob = null
         fallDetector.stop()
+        getup.stop()
         wakeDetector.stop()
         if (_uiState.value.recording) {
             audio.stopRecordingToWavBase64()
@@ -321,9 +329,10 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
         if (s.recording) {
             withContext(Dispatchers.IO) { audio.stopRecordingToWavBase64() }
         }
-        // Tell Ally straight away: it asks her first on the tablet, and involves family only if
-        // she cannot answer. This is independent of the legacy emergency voice link below.
+        // One brain (bible v5 #1): the fall goes to the Suraksha backend only. It asks her first and
+        // runs the Get-Up Vote on the readings we stream next. The legacy /ws emergency link is gone.
         viewModelScope.launch(Dispatchers.IO) { allyHttp.postWatch("fall") }
+        getup.onFall()
         _uiState.update {
             it.copy(
                 mode = WatchMode.SOS,
@@ -335,19 +344,11 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
                 lastAiText = "",
             )
         }
-        // Care stays connected in background; emergency owns the mic/TTS now.
-        sosTriggerSent = false
-        emergency.connect()
-        // Last-resort alert if /ws never comes up. Long delay so voice path wins.
+        _uiState.update { it.copy(statusMessage = "Suraksha is checking on you…") }
+        // Return to normal once the 60 s get-up stream is done; the backend owns what happens next.
         viewModelScope.launch {
-            delay(8_000)
-            if (_uiState.value.mode == WatchMode.SOS && !emergency.connected && !sosTriggerSent) {
-                sosTriggerSent = true
-                withContext(Dispatchers.IO) { httpTriggerFall() }
-                _uiState.update {
-                    it.copy(statusMessage = "Fall alert sent (no live voice link)")
-                }
-            }
+            delay(65_000)
+            if (_uiState.value.mode == WatchMode.SOS) endSosAndReturnToCare()
         }
     }
 
