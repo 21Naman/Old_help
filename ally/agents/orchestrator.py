@@ -161,11 +161,15 @@ async def on_watch(
     steps: int | None = None,
     heart_rate: int | None = None,
     source: str = "watch",
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A sensor event from the watch or the phone. Both may be worn; events dedupe by day / window."""
     repo = get_repo()
     now = clock.now()
-    signal = repo.add_signal(parent_id, kind, steps=steps, heart_rate=heart_rate, source=source)
+    signal = repo.add_signal(parent_id, kind, steps=steps, heart_rate=heart_rate, source=source, **(extra or {}))
+    if kind in ("getup_ref", "getup_sample", "drop"):
+        # Readings for the Get-Up Vote, or a dropped watch (GREY): stored, never an alert by themselves.
+        return {"signal": signal}
     if kind == "im_okay":
         investigation = repo.open_investigation(parent_id)
         if _is_fall(investigation) and not NAIVE_MODE:
@@ -262,7 +266,7 @@ def fall_evidence(parent_id: str, profile: dict[str, Any], investigation: dict[s
         pressure=[getup_vote.PressureSample(secs(s), float(s["p_hpa"]), float(s.get("arm_var") or 0)) for s in samples if s.get("p_hpa") is not None],
         step_events=max(steps) if steps else None,
         strides=max(strides) if strides else None,
-        heart=[getup_vote.HeartSample(secs(s), int(s["hr"])) for s in samples if s.get("hr") is not None],
+        heart=[getup_vote.HeartSample(secs(s), int(s.get("hr") or s["heart_rate"])) for s in samples if (s.get("hr") or s.get("heart_rate")) is not None],
         spo2=min((int(s["spo2"]) for s in samples if s.get("spo2") is not None), default=None),
         ppg_lost=any(s.get("ppg_lost") for s in samples),
     )

@@ -101,9 +101,20 @@ async def ally_error_handler(request: Request, exc: AllyError) -> JSONResponse:
 
 
 class WatchIn(BaseModel):
-    kind: Literal["wake", "first_movement", "activity", "im_okay", "fall"] = "activity"
+    kind: Literal["wake", "first_movement", "activity", "im_okay", "fall", "drop", "getup_ref", "getup_sample"] = "activity"
     steps: int | None = Field(default=None, ge=0)
     heart_rate: int | None = Field(default=None, ge=20, le=250)
+    # After a fall (bible v5 L1/L4): the watch sends getup_ref once, then getup_sample every ~2 s.
+    p_ref_hpa: float | None = Field(default=None, ge=300, le=1100)
+    p_hpa: float | None = Field(default=None, ge=300, le=1100)
+    arm_var: float | None = Field(default=None, ge=0)
+    strides: int | None = Field(default=None, ge=0)
+    spin_deg: float | None = Field(default=None, ge=0)
+    on_wrist: bool | None = None
+    charging: bool | None = None
+    dropped: bool | None = None
+    spo2: int | None = Field(default=None, ge=50, le=100)
+    ppg_lost: bool | None = None
     # Which device sent it. Older watch builds omit it.
     source: Literal["watch", "phone"] = "watch"
 
@@ -521,8 +532,12 @@ async def device_event(
     x_suraksha_device_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     verify_device_key(_device_key(x_ally_device_key, x_suraksha_device_key), body.source)
+    extra = body.model_dump(
+        exclude_none=True,
+        include={"p_ref_hpa", "p_hpa", "arm_var", "strides", "spin_deg", "on_wrist", "charging", "dropped", "spo2", "ppg_lost"},
+    )
     return await orchestrator.on_watch(
-        PARENT_ID, body.kind, steps=body.steps, heart_rate=body.heart_rate, source=body.source
+        PARENT_ID, body.kind, steps=body.steps, heart_rate=body.heart_rate, source=body.source, extra=extra
     )
 
 

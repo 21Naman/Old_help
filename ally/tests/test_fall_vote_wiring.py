@@ -171,3 +171,40 @@ def test_peela_reply_route_is_family_only(monkeypatch, seeded, repo, pushes, sfn
     assert client.post("/suraksha/alerts/x/peela", json={"answer": "spoke"}, headers={"x-dev-member": "parent"}).status_code == 403
     res = client.post("/suraksha/alerts/x/peela", json={"answer": "spoke"}, headers={"x-dev-member": "priya"})
     assert res.status_code == 200 and res.json()["ok"] is False  # unknown alert, nothing changes
+
+
+def test_watch_endpoint_accepts_getup_readings_and_drop(monkeypatch, seeded, repo, pushes, sfn):
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ALLY_DEV_TOOLS", "1")
+    import auth
+    import config
+
+    importlib.reload(config)
+    importlib.reload(auth)
+    import app as app_module
+
+    importlib.reload(app_module)
+    client = TestClient(app_module.app)
+    key = {"x-ally-device-key": "device-key"}
+    ok = client.post("/suraksha/watch", json={"kind": "getup_ref", "p_ref_hpa": 920.0, "on_wrist": True}, headers=key)
+    assert ok.status_code == 200, ok.text
+    assert client.post("/suraksha/watch", json={"kind": "getup_sample", "p_hpa": 920.01, "arm_var": 0.3, "steps": 4, "heart_rate": 90}, headers=key).status_code == 200
+    assert client.post("/suraksha/watch", json={"kind": "drop", "dropped": True}, headers=key).status_code == 200
+    kinds = [s["kind"] for s in repo.signals_between("amma", clock.now() - timedelta(minutes=1), clock.now() + timedelta(minutes=1))]
+    assert {"getup_ref", "getup_sample", "drop"} <= set(kinds)
+    assert not repo.list_alerts("amma")  # readings and drops never raise an alert by themselves
+
+
+async def test_heart_rate_field_from_watch_feeds_concern_flags(seeded, repo, pushes, sfn, says):
+    await orchestrator.on_watch("amma", "fall")
+    await orchestrator.on_watch("amma", "getup_ref", extra={"p_ref_hpa": P_REF})
+    start = clock.now()
+    for t in range(0, 31, 5):
+        clock.set_now(start + timedelta(seconds=t))
+        await orchestrator.on_watch("amma", "getup_sample", heart_rate=140, extra={"p_hpa": P_REF + 0.01})
+    says.append(OK)
+    out = await orchestrator.on_parent_turn("amma", "haan main bilkul theek hoon", source="voice", duration_sec=2.0)
+    assert out["fall_tier"] == "LAAL" and "hr_high" in out["flags"]
