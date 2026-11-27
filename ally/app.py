@@ -127,6 +127,10 @@ class TtsIn(BaseModel):
     language: Literal["hi-IN", "en-IN"] = "hi-IN"
 
 
+class PeelaReplyIn(BaseModel):
+    answer: Literal["spoke", "no_answer"]
+
+
 class EscalationReplyIn(BaseModel):
     decision: Literal["accept", "decline", "arrived"]
 
@@ -419,6 +423,13 @@ def alert_detail(alert_id: str, identity: Identity = Depends(current_identity)) 
         "parent_words": None if not words_ok else [],
         "parent_words_note": None if words_ok else f"{profile.get('name', 'Amma')} keeps her conversations private.",
     }
+
+
+@api.post("/alerts/{alert_id}/peela")
+async def peela_reply(alert_id: str, body: PeelaReplyIn, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    """Yellow tier: the child says whether they reached her (bible v5 L4)."""
+    require_family(identity)
+    return await orchestrator.peela_reply(identity.parent_id, alert_id, identity.member_id, body.answer)
 
 
 @api.post("/family/ask")

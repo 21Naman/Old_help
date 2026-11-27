@@ -20,6 +20,8 @@ PUSH_TITLES = {
     "escalation_ask": "Can you check on Amma?",
     "escalation_update": "Update about Amma",
     "all_clear": "Amma is okay",
+    "peela_call": "Please give Amma a call",
+    "peela_said": "Suraksha",
 }
 
 

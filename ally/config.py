@@ -79,6 +79,8 @@ CORS_ORIGINS = [
 DEV_TOOLS = _b("ALLY_DEV_TOOLS")
 
 ESCALATION_CONTACT_TIMEOUT = _i("ESCALATION_CONTACT_TIMEOUT", 180)
+# PEELA: how long the nearest child has to say "Spoke to her" before it turns red (bible v5 L4).
+PEELA_TIMEOUT_S = _i("PEELA_TIMEOUT_S", 600)
 INVESTIGATION_WINDOW_MIN = _i("INVESTIGATION_WINDOW_MIN", 15)
 # A possible fall is asked about first, but waits far less before involving family.
 FALL_WINDOW_MIN = _i("FALL_WINDOW_MIN", 2)

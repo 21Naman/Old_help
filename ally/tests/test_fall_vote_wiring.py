@@ -87,3 +87,87 @@ async def test_ok_with_pain_words_escalates(seeded, repo, pushes, sfn, says):
     out = await orchestrator.on_parent_turn("amma", "theek hoon bas thoda dard hai", source="voice", duration_sec=2.5)
     assert out["fall_tier"] == "LAAL" and "pain_words" in out["flags"]
     assert sfn.started
+
+
+# ---- PEELA: the third option (bible v5 L4) --------------------------------------------------
+
+
+@pytest.fixture
+def cities(repo, seeded):
+    repo.put_profile("amma", {**seeded, "city": "Bengaluru"})
+    for m in repo.list_members("amma"):
+        city = {"rahul": "Pune", "priya": "Bengaluru", "sunita": "Bengaluru"}[m["id"]]
+        repo.put_member("amma", {**m, "city": city})
+
+
+def fall_alert(repo):
+    return next(a for a in repo.list_alerts("amma") if a["kind"] == "fall")
+
+
+async def _peela(orch, repo, says):
+    await orch.on_watch("amma", "fall")
+    says.append(OK)
+    return await orch.on_parent_turn("amma", "theek hoon", source="voice", duration_sec=1.0)
+
+
+async def test_peela_asks_the_same_city_child_to_call_without_health_detail(cities, repo, pushes, sfn, says):
+    out = await _peela(orchestrator, repo, says)
+    assert out["fall_tier"] == "PEELA" and out["peela_member"] == "priya"
+    ask = [p for p in pushes if p["audience"] == "priya" and p["type"] == "peela_call"]
+    assert len(ask) == 1 and "call" in ask[0]["body"]
+    assert not any(w in ask[0]["body"].lower() for w in ("fall", "fell", "hurt", "गिर"))
+    assert "मान ली" in out["say"]  # she hears that she's believed
+    assert not [p for p in pushes if p["audience"] == "rahul"] and not sfn.started
+
+
+async def test_peela_falls_back_to_family_order_without_city(seeded, repo, pushes, sfn, says):
+    out = await _peela(orchestrator, repo, says)
+    assert out["peela_member"] == "rahul"
+
+
+async def test_child_spoke_to_her_resolves_it(cities, repo, pushes, sfn, says):
+    await _peela(orchestrator, repo, says)
+    res = await orchestrator.peela_reply("amma", fall_alert(repo)["id"], "priya", "spoke")
+    assert res["status"] == "resolved" and not sfn.started
+    assert fall_alert(repo)["status"] == "resolved"
+
+
+async def test_no_answer_turns_it_red(cities, repo, pushes, sfn, says):
+    await _peela(orchestrator, repo, says)
+    res = await orchestrator.peela_reply("amma", fall_alert(repo)["id"], "priya", "no_answer")
+    assert res["status"] == "escalating" and sfn.started
+    assert fall_alert(repo)["fall_tier"] == "LAAL"
+
+
+async def test_no_reply_before_timeout_turns_it_red(cities, repo, pushes, sfn, says):
+    await _peela(orchestrator, repo, says)
+    clock.set_now(clock.now() + timedelta(seconds=601))
+    out = await orchestrator.sweep()
+    assert out["peela_timeouts"] == 1 and sfn.started
+    assert fall_alert(repo)["peela_outcome"] == "timeout"
+
+
+async def test_button_press_also_tells_her_on_the_device(cities, repo, pushes, sfn):
+    await orchestrator.on_watch("amma", "fall")
+    await orchestrator.on_watch("amma", "im_okay")
+    assert [p for p in pushes if p["audience"] == "parent" and p["type"] == "peela_said"]
+
+
+def test_peela_reply_route_is_family_only(monkeypatch, seeded, repo, pushes, sfn):
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ALLY_DEV_TOOLS", "1")
+    import auth
+    import config
+
+    importlib.reload(config)
+    importlib.reload(auth)
+    import app as app_module
+
+    importlib.reload(app_module)
+    client = TestClient(app_module.app)
+    assert client.post("/suraksha/alerts/x/peela", json={"answer": "spoke"}, headers={"x-dev-member": "parent"}).status_code == 403
+    res = client.post("/suraksha/alerts/x/peela", json={"answer": "spoke"}, headers={"x-dev-member": "priya"})
+    assert res.status_code == 200 and res.json()["ok"] is False  # unknown alert, nothing changes

@@ -11,7 +11,7 @@ from typing import Any
 
 from agents import companion
 from agents.schemas import CompanionReply, DeviationJudgment
-from config import FALL_WINDOW_MIN, INVESTIGATION_WINDOW_MIN, NAIVE_MODE, WAKE_GRACE_MIN
+from config import FALL_WINDOW_MIN, INVESTIGATION_WINDOW_MIN, NAIVE_MODE, PEELA_TIMEOUT_S, WAKE_GRACE_MIN
 from core import clock
 from core.errors import LLMError, NotConfigured
 from core.ids import new_id
@@ -291,12 +291,85 @@ async def verify_fall_answer(
             alert = repo.update_alert(parent_id, alert, status="escalating", tier=2, fall_tier="LAAL", votes=result.votes)
             return {**outcome, **(await _escalate(parent_id, alert, "critical"))}
         return outcome
-    # PEELA: she says she's fine but her body doesn't confirm it. Not resolved.
-    # The "please call Amma" message and its timeout are the next piece (bible v5 §17a step 3).
+    # PEELA: she says she's fine but her body doesn't confirm it. Believe her out loud, and ask the
+    # nearest child to call. No siren, no health detail. No answer turns it red.
     repo.close_investigation(parent_id, investigation["id"], "peela")
+    peela = await _start_peela(parent_id, profile, alert, votes=result.votes, spoken_reply=bool(text))
+    return {**outcome, "resolved": False, **peela}
+
+
+def nearest_child(parent_id: str, profile: dict[str, Any]) -> dict[str, Any] | None:
+    """The child most likely to reach her: same city first, then the family's own order."""
+    children = [m for m in get_repo().list_members(parent_id) if m.get("role") == "child"]
+    if not children:
+        return None
+    city = (profile.get("city") or "").strip().lower()
+    same_city = [m for m in children if city and (m.get("city") or "").strip().lower() == city]
+    return (same_city or children)[0]
+
+
+async def _start_peela(
+    parent_id: str, profile: dict[str, Any], alert: dict[str, Any] | None, *, votes: dict[str, Any], spoken_reply: bool
+) -> dict[str, Any]:
+    repo = get_repo()
+    child = nearest_child(parent_id, profile)
+    hi = profile.get("language") == "hi-IN"
+    who = display(child, "hi-IN" if hi else "en-IN", "")
+    say = (
+        f"ठीक है {display(profile, 'hi-IN')}, आपकी बात मान ली। बस {who} को बोल रही हूँ एक बार कॉल कर ले।"
+        if hi
+        else f"Okay {profile['name']}, I believe you. I'm just asking {who} to give you a call."
+    )
+    due = clock.iso(clock.now() + timedelta(seconds=PEELA_TIMEOUT_S))
     if alert:
-        repo.update_alert(parent_id, alert, status="peela", fall_tier="PEELA", votes=result.votes)
-    return {**outcome, "resolved": False}
+        alert = repo.update_alert(
+            parent_id, alert, status="peela", fall_tier="PEELA", votes=votes,
+            peela_member=child["id"] if child else None, peela_due_at=due,
+        )
+    if child and alert:
+        await channel.post(
+            parent_id,
+            audience=child["id"],
+            kind="peela_call",
+            body=f"Please give {profile['name']} a call when you can.",
+            related_id=f"peela#{alert['id']}",
+            data={"alert_id": alert["id"], "actions": ["spoke", "no_answer"], "due_at": due},
+        )
+    if not spoken_reply and alert:
+        # She pressed the button instead of speaking, so tell her on the watch/tablet too.
+        await channel.post(parent_id, audience="parent", kind="peela_said", body=say, related_id=f"peela_parent#{alert['id']}")
+    log("peela_started", parent_id=parent_id, member=child["id"] if child else None, due_at=due)
+    return {"say": say, "peela_member": child["id"] if child else None, "peela_due_at": due}
+
+
+async def peela_reply(parent_id: str, alert_id: str, member_id: str, answer: str) -> dict[str, Any]:
+    """The child answers the yellow ask: "spoke" (she's fine) closes it, "no_answer" turns it red."""
+    repo = get_repo()
+    alert = repo.get_alert(parent_id, alert_id)
+    if not alert or alert.get("status") != "peela":
+        return {"ok": False, "status": alert.get("status") if alert else None}
+    if answer == "spoke":
+        repo.update_alert(parent_id, alert, status="resolved", resolution=f"family_spoke:{member_id}")
+        log("peela_resolved", parent_id=parent_id, member=member_id)
+        return {"ok": True, "status": "resolved"}
+    return {"ok": True, **(await _peela_to_laal(parent_id, alert, reason=f"no_answer:{member_id}"))}
+
+
+async def _peela_to_laal(parent_id: str, alert: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    alert = get_repo().update_alert(parent_id, alert, status="escalating", tier=2, fall_tier="LAAL", peela_outcome=reason)
+    log("peela_to_laal", parent_id=parent_id, reason=reason)
+    return {"status": "escalating", **(await _escalate(parent_id, alert, "critical"))}
+
+
+async def peela_timeouts(now: Any) -> int:
+    count = 0
+    for parent_id in _parent_ids():
+        for alert in get_repo().list_alerts(parent_id, limit=20):
+            due = alert.get("peela_due_at")
+            if alert.get("status") == "peela" and due and clock.parse_iso(due) <= now:
+                await _peela_to_laal(parent_id, alert, reason="timeout")
+                count += 1
+    return count
 
 
 def _open_investigation(
@@ -349,6 +422,10 @@ async def sweep() -> dict[str, Any]:
             out["investigations"] += 1
         except Exception as exc:
             log("investigation_timeout_failed", parent_id=inv["parent_id"], error=repr(exc))
+    try:
+        out["peela_timeouts"] = await peela_timeouts(now)
+    except Exception as exc:
+        log("peela_sweep_failed", error=repr(exc))
     try:
         out["escalations"] = await escalation_machine.sweep_timeouts()
     except Exception as exc:
