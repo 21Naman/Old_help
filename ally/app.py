@@ -541,6 +541,69 @@ async def device_event(
     )
 
 
+# ---- watch voice (device key, no user login): the fall conversation happens on her wrist ------
+
+
+async def _spoken(text: str | None, language: str) -> dict[str, Any]:
+    """Attach edge-tts audio to a line the backend chose. If TTS fails the watch still shows the text."""
+    if not text:
+        return {"say": None, "audio_base64": None, "mime_type": None}
+    try:
+        audio = await speech.synthesize(text, language)
+        return {"say": text, "audio_base64": audio["audio_base64"], "mime_type": audio["mime_type"]}
+    except Exception as exc:  # noqa: BLE001
+        log("device_tts_failed", error=repr(exc))
+        return {"say": text, "audio_base64": None, "mime_type": None}
+
+
+@api.post("/device/fall")
+async def device_fall(
+    x_ally_device_key: str | None = Header(default=None),
+    x_suraksha_device_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Same as POST /watch {kind: fall}, plus the question as audio so the watch can speak it."""
+    verify_device_key(_device_key(x_ally_device_key, x_suraksha_device_key), "watch")
+    out = await orchestrator.on_watch(PARENT_ID, "fall", source="watch")
+    return {**out, **(await _spoken(out.get("question"), out.get("language", "hi-IN")))}
+
+
+@api.post("/device/answer")
+async def device_answer(
+    body: AudioIn,
+    x_ally_device_key: str | None = Header(default=None),
+    x_suraksha_device_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Her spoken answer, recorded on the watch: Wispr Flow -> companion -> (after a fall) Get-Up Vote."""
+    verify_device_key(_device_key(x_ally_device_key, x_suraksha_device_key), "watch")
+    profile = get_repo().get_profile(PARENT_ID) or {}
+    language = profile.get("language", "hi-IN")
+    try:
+        raw = base64.b64decode(body.audio_base64, validate=True)
+    except ValueError as exc:
+        raise Forbidden("That recording could not be read.", detail=repr(exc)) from exc
+    transcript = await stt.transcribe(raw, language)
+    if not transcript.text:
+        again = "माफ़ कीजिए, फिर से बोलिए।" if language == "hi-IN" else "Sorry, please say that again."
+        return {"stt_empty": True, "transcript_in": "", **(await _spoken(again, language))}
+    result = await orchestrator.on_parent_turn(
+        PARENT_ID, transcript.text, source="watch", language=transcript.language, duration_sec=transcript.duration_sec
+    )
+    spoken = await _spoken(result.get("say"), result.get("language") or language)
+    return {**{k: v for k, v in result.items() if k not in ("say",)}, "stt_empty": False, "transcript_in": transcript.text, **spoken}
+
+
+@api.get("/device/pending")
+async def device_pending(
+    x_ally_device_key: str | None = Header(default=None),
+    x_suraksha_device_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Messages for her (stay updates, 'I believe you', who is coming) with audio, for the watch to speak."""
+    verify_device_key(_device_key(x_ally_device_key, x_suraksha_device_key), "watch")
+    language = (get_repo().get_profile(PARENT_ID) or {}).get("language", "hi-IN")
+    messages = channel.claim(PARENT_ID, "parent")
+    return {"messages": [{"id": m["id"], "kind": m["kind"], **(await _spoken(m["body"], language))} for m in messages]}
+
+
 @api.get("/guard/call")
 async def guard_call(
     speak: bool = False,

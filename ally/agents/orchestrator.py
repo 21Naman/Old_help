@@ -232,7 +232,7 @@ async def on_possible_fall(parent_id: str, now: Any, *, source: str = "watch") -
         data={"reason": "fall"},
     )
     log("possible_fall", parent_id=parent_id, alert_id=alert["id"], window_min=FALL_WINDOW_MIN)
-    return {"fall": True, "alert_id": alert["id"], "asked_parent": True}
+    return {"fall": True, "alert_id": alert["id"], "asked_parent": True, "question": body, "language": profile.get("language", "hi-IN")}
 
 
 def _is_fall(investigation: dict[str, Any] | None) -> bool:
