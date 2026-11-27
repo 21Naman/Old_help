@@ -134,6 +134,11 @@ class AudioBridge(private val context: Context) {
     }
 
     /** Fetch TTS over HTTP (preferred on Wear — keeps WS frames small). */
+    /** Play backend audio (edge-tts sends MP3). Blocks until playback ends. */
+    suspend fun playBase64(base64: String, ext: String) = withContext(Dispatchers.IO) {
+        playAudioBytes(android.util.Base64.decode(base64, android.util.Base64.DEFAULT), ext)
+    }
+
     suspend fun playUrl(url: String) = withContext(Dispatchers.IO) {
         Log.i(tag, "Fetching TTS $url")
         val request = Request.Builder().url(url).get().build()

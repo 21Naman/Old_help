@@ -27,6 +27,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -331,7 +332,6 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
         }
         // One brain (bible v5 #1): the fall goes to the Suraksha backend only. It asks her first and
         // runs the Get-Up Vote on the readings we stream next. The legacy /ws emergency link is gone.
-        viewModelScope.launch(Dispatchers.IO) { allyHttp.postWatch("fall") }
         getup.onFall()
         _uiState.update {
             it.copy(
@@ -345,11 +345,78 @@ class RakshakViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         _uiState.update { it.copy(statusMessage = "Suraksha is checking on you…") }
-        // Return to normal once the 60 s get-up stream is done; the backend owns what happens next.
-        viewModelScope.launch {
-            delay(65_000)
-            if (_uiState.value.mode == WatchMode.SOS) endSosAndReturnToCare()
+        viewModelScope.launch { runFallConversation() }
+    }
+
+    /**
+     * The fall conversation on her wrist (bible v5 L3/L4/L7): speak the question, record her answer,
+     * speak the reply (the backend runs the Get-Up Vote), then keep speaking status lines until help
+     * arrives. Every line comes from the backend; the watch never makes one up.
+     */
+    private suspend fun runFallConversation() {
+        val fall = withContext(Dispatchers.IO) { allyHttp.deviceFall() }
+        if (fall == null) {
+            _uiState.update { it.copy(statusMessage = "No connection. Tap Help or I'm okay.") }
+            return
         }
+        speak(fall)
+        var tier: String? = null
+        for (attempt in 0 until 2) {
+            val wav = listen(ANSWER_MS) ?: break
+            val reply = withContext(Dispatchers.IO) { allyHttp.deviceAnswer(wav) } ?: break
+            speak(reply)
+            if (!reply.optBoolean("stt_empty")) {
+                tier = reply.str("fall_tier")
+                break
+            }
+        }
+        if (tier == "HARA" || tier == "GREY") {
+            endSosAndReturnToCare()
+            return
+        }
+        // Yellow, red, or no answer yet: stay with her and speak whatever the backend has for her.
+        val until = System.currentTimeMillis() + STAY_MAX_MS
+        while (_uiState.value.mode == WatchMode.SOS && System.currentTimeMillis() < until) {
+            delay(PENDING_POLL_MS)
+            val msgs = withContext(Dispatchers.IO) { allyHttp.devicePending() } ?: continue
+            for (i in 0 until msgs.length()) {
+                val m = msgs.getJSONObject(i)
+                speak(m)
+                if (m.str("kind") == "all_clear") {
+                    endSosAndReturnToCare()
+                    return
+                }
+            }
+        }
+        endSosAndReturnToCare()
+    }
+
+    private suspend fun speak(o: JSONObject) {
+        o.str("say")?.let { text -> _uiState.update { it.copy(lastAiText = text) } }
+        val audioB64 = o.str("audio_base64") ?: return
+        try {
+            audio.playBase64(audioB64, "mp3")
+        } catch (e: Exception) {
+            Log.w("RakshakVM", "Playback failed; text is on screen", e)
+        }
+    }
+
+    /** Record her answer. Needs the app in the foreground (Android 14 mic rule); see bible v5 §17a step 7. */
+    private suspend fun listen(ms: Long): String? {
+        if (!audio.startRecording()) return null
+        _uiState.update { it.copy(recording = true, statusMessage = "Listening…") }
+        delay(ms)
+        val wav = withContext(Dispatchers.IO) { audio.stopRecordingToWavBase64() }
+        _uiState.update { it.copy(recording = false, statusMessage = "Suraksha is checking on you…") }
+        return wav
+    }
+
+    private fun JSONObject.str(key: String): String? = if (isNull(key)) null else optString(key).ifEmpty { null }
+
+    private companion object {
+        const val ANSWER_MS = 6_000L
+        const val PENDING_POLL_MS = 10_000L
+        const val STAY_MAX_MS = 30 * 60_000L
     }
 
     private fun endSosAndReturnToCare() {

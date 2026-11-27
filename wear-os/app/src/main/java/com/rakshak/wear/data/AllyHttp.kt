@@ -40,6 +40,38 @@ class AllyHttp(
         return post("/ally/watch", json.toString())
     }
 
+    // ---- the fall conversation on the watch (device key) -------------------------------------
+
+    /** Report a fall; the reply carries the spoken question (`say` + `audio_base64`). */
+    fun deviceFall(): JSONObject? = call("POST", "/ally/device/fall", "{}")
+
+    /** Her recorded answer (16 kHz PCM16 WAV, base64). Reply: `say`, `audio_base64`, `fall_tier`, `stt_empty`. */
+    fun deviceAnswer(wavBase64: String): JSONObject? =
+        call("POST", "/ally/device/answer", JSONObject().put("audio_base64", wavBase64).put("mime_type", "audio/wav").toString())
+
+    /** Pending lines for her (stay updates, who is coming), each with audio. */
+    fun devicePending(): org.json.JSONArray? = call("GET", "/ally/device/pending", null)?.optJSONArray("messages")
+
+    private fun call(method: String, path: String, json: String?): JSONObject? {
+        return try {
+            val builder = Request.Builder()
+                .url(origin.trimEnd('/') + path)
+                .header("X-Ally-Device-Key", deviceKey)
+            if (method == "GET") builder.get()
+            else builder.post((json ?: "{}").toRequestBody("application/json".toMediaType()))
+            http.newCall(builder.build()).execute().use { res ->
+                val text = res.body?.string().orEmpty()
+                if (!res.isSuccessful) {
+                    Log.w(tag, "$method $path failed: HTTP ${res.code}")
+                    null
+                } else JSONObject(text.ifEmpty { "{}" })
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "$method $path failed", e)
+            null
+        }
+    }
+
     private fun post(path: String, json: String): Boolean {
         repeat(2) { attempt ->
             try {
