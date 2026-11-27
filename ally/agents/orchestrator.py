@@ -11,7 +11,7 @@ from typing import Any
 
 from agents import companion
 from agents.schemas import CompanionReply, DeviationJudgment
-from config import FALL_WINDOW_MIN, INVESTIGATION_WINDOW_MIN, WAKE_GRACE_MIN
+from config import FALL_WINDOW_MIN, INVESTIGATION_WINDOW_MIN, NAIVE_MODE, WAKE_GRACE_MIN
 from core import clock
 from core.errors import LLMError, NotConfigured
 from core.ids import new_id
@@ -19,6 +19,7 @@ from core.names import display
 from core.log import log
 from escalation import machine as escalation_machine
 from escalation import service as escalation
+from getup import vote as getup_vote
 from policy import consent
 from policy.tiers import TIER_LABEL, decide
 from proactive import channel, morning, reminders
@@ -110,6 +111,9 @@ async def _assess_parent_words(
 ) -> dict[str, Any]:
     repo = get_repo()
     if reply.parent_says_okay and not reply.parent_reports_unwell:
+        if _is_fall(investigation) and not NAIVE_MODE:
+            # After a fall her "theek hoon" is one vote; her body has to agree (bible v5 L4).
+            return await verify_fall_answer(parent_id, profile, investigation, text=text, duration_sec=duration_sec)
         if investigation or repo.active_escalation_id(parent_id):
             await on_im_okay(parent_id, source="parent_words")
             return {"escalated": False, "resolved": True}
@@ -163,6 +167,9 @@ async def on_watch(
     now = clock.now()
     signal = repo.add_signal(parent_id, kind, steps=steps, heart_rate=heart_rate, source=source)
     if kind == "im_okay":
+        investigation = repo.open_investigation(parent_id)
+        if _is_fall(investigation) and not NAIVE_MODE:
+            return {"signal": signal, **(await verify_fall_answer(parent_id, _profile(parent_id), investigation, text="", duration_sec=None))}
         return {"signal": signal, **(await on_im_okay(parent_id, source=source))}
     if kind == "fall":
         return {"signal": signal, **(await on_possible_fall(parent_id, now, source=source))}
@@ -222,6 +229,74 @@ async def on_possible_fall(parent_id: str, now: Any, *, source: str = "watch") -
     )
     log("possible_fall", parent_id=parent_id, alert_id=alert["id"], window_min=FALL_WINDOW_MIN)
     return {"fall": True, "alert_id": alert["id"], "asked_parent": True}
+
+
+def _is_fall(investigation: dict[str, Any] | None) -> bool:
+    return bool(investigation and investigation.get("reason") == "fall")
+
+
+def fall_evidence(parent_id: str, profile: dict[str, Any], investigation: dict[str, Any], *, text: str, duration_sec: float | None) -> getup_vote.FallEvidence:
+    """Collect what the device reported since we asked her (`getup_ref` once, `getup_sample` every few seconds)."""
+    asked = clock.parse_iso(investigation["asked_at"])
+    signals = get_repo().signals_between(parent_id, asked - timedelta(seconds=30), clock.now())
+    ref = next((s for s in reversed(signals) if s.get("kind") == "getup_ref"), {})
+    samples = [s for s in signals if s.get("kind") == "getup_sample"]
+    t0 = asked.timestamp()
+
+    def secs(s: dict[str, Any]) -> float:
+        return clock.parse_iso(s["at"]).timestamp() - t0
+
+    steps = [int(s["steps"]) for s in samples if s.get("steps") is not None]
+    strides = [int(s["strides"]) for s in samples if s.get("strides") is not None]
+    vocal = (profile.get("baseline") or {}).get("vocal_baseline") or {}
+    return getup_vote.FallEvidence(
+        says_ok=True,
+        reply_text=text,
+        reply_seconds=duration_sec,
+        usual_wpm=float(vocal.get("avg_words_per_min") or 110),
+        dropped=bool(ref.get("dropped", False)),
+        spin_deg=float(ref.get("spin_deg") or 0),
+        on_wrist=ref.get("on_wrist", True),
+        charging=bool(ref.get("charging", False)),
+        p_ref_hpa=ref.get("p_ref_hpa"),
+        pressure=[getup_vote.PressureSample(secs(s), float(s["p_hpa"]), float(s.get("arm_var") or 0)) for s in samples if s.get("p_hpa") is not None],
+        step_events=max(steps) if steps else None,
+        strides=max(strides) if strides else None,
+        heart=[getup_vote.HeartSample(secs(s), int(s["hr"])) for s in samples if s.get("hr") is not None],
+        spo2=min((int(s["spo2"]) for s in samples if s.get("spo2") is not None), default=None),
+        ppg_lost=any(s.get("ppg_lost") for s in samples),
+    )
+
+
+async def verify_fall_answer(
+    parent_id: str, profile: dict[str, Any], investigation: dict[str, Any], *, text: str, duration_sec: float | None
+) -> dict[str, Any]:
+    """She says she's fine after a fall. Decide HARA / PEELA / LAAL / GREY from her words and her body."""
+    repo = get_repo()
+    result = getup_vote.decide(fall_evidence(parent_id, profile, investigation, text=text, duration_sec=duration_sec))
+    alert = repo.get_alert(parent_id, investigation.get("alert_id") or "")
+    outcome: dict[str, Any] = {"escalated": False, "fall_tier": result.tier, "votes": result.votes, "flags": result.flags}
+    log("fall_vote", parent_id=parent_id, tier=result.tier, votes=result.votes, flags=result.flags)
+
+    if result.tier == "HARA":
+        await on_im_okay(parent_id, source="fall_verified")
+        return {**outcome, "resolved": True}
+    if result.tier == "GREY":
+        repo.close_investigation(parent_id, investigation["id"], "grey")
+        _resolve_alert(parent_id, investigation.get("alert_id"), "grey_cannot_tell")
+        return {**outcome, "resolved": True}
+    if result.tier == "LAAL":
+        repo.close_investigation(parent_id, investigation["id"], "concern_confirmed")
+        if alert:
+            alert = repo.update_alert(parent_id, alert, status="escalating", tier=2, fall_tier="LAAL", votes=result.votes)
+            return {**outcome, **(await _escalate(parent_id, alert, "critical"))}
+        return outcome
+    # PEELA: she says she's fine but her body doesn't confirm it. Not resolved.
+    # The "please call Amma" message and its timeout are the next piece (bible v5 §17a step 3).
+    repo.close_investigation(parent_id, investigation["id"], "peela")
+    if alert:
+        repo.update_alert(parent_id, alert, status="peela", fall_tier="PEELA", votes=result.votes)
+    return {**outcome, "resolved": False}
 
 
 def _open_investigation(

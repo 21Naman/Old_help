@@ -26,6 +26,8 @@ def _b(key: str) -> bool:
 
 
 PARENT_ID = _s("ALLY_PARENT_ID", "amma")
+# Demo switch: the old "she said she's okay, so close it" behaviour (bible v5 Naive mode).
+NAIVE_MODE = _b("SURAKSHA_NAIVE_MODE")
 HOST = _s("ALLY_HOST", "0.0.0.0")
 PORT = _i("PORT", _i("ALLY_PORT", 8002))  # Render sets PORT
 TZ = _s("ALLY_TZ", "Asia/Kolkata")

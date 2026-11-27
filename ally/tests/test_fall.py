@@ -74,7 +74,7 @@ async def test_critical_fall_lets_ally_ask_the_neighbour_after_the_children_time
     assert allowed.allowed
 
 
-async def test_she_says_she_is_fine_so_nobody_is_called(seeded, repo, pushes, sfn, monkeypatch):
+async def test_she_says_she_is_fine_gives_peela_and_nobody_is_called(seeded, repo, pushes, sfn, monkeypatch):
     async def fake_respond(parent_id, text, *, investigating, source):
         reply = CompanionReply(say="अच्छा हुआ।", language="hi-IN", parent_says_okay=True)
         return reply, companion.RunEffects(), type("G", (), {"denied_tools": []})()
@@ -83,12 +83,28 @@ async def test_she_says_she_is_fine_so_nobody_is_called(seeded, repo, pushes, sf
     await orchestrator.on_watch("amma", "fall")
     result = await orchestrator.on_parent_turn("amma", "मैं ठीक हूँ, बस थोड़ा फिसल गई", source="voice")
 
+    # Bible v5: her words alone don't close a fall. No siren, but not resolved either (PEELA).
+    assert result["fall_tier"] == "PEELA" and result["resolved"] is False and not sfn.started
+    assert repo.list_alerts("amma")[0]["status"] == "peela"
+
+
+async def test_she_says_she_is_fine_closes_it_in_naive_mode(seeded, repo, pushes, sfn, monkeypatch):
+    async def fake_respond(parent_id, text, *, investigating, source):
+        reply = CompanionReply(say="अच्छा हुआ।", language="hi-IN", parent_says_okay=True)
+        return reply, companion.RunEffects(), type("G", (), {"denied_tools": []})()
+
+    monkeypatch.setattr(companion, "respond", fake_respond)
+    monkeypatch.setattr(orchestrator, "NAIVE_MODE", True)
+    await orchestrator.on_watch("amma", "fall")
+    result = await orchestrator.on_parent_turn("amma", "मैं ठीक हूँ, बस थोड़ा फिसल गई", source="voice")
+
     assert result.get("resolved") and not sfn.started
     assert repo.open_investigation("amma") is None
     assert repo.list_alerts("amma")[0]["status"] == "resolved"
 
 
-async def test_watch_im_okay_button_also_clears_a_fall(seeded, repo, pushes, sfn):
+async def test_watch_im_okay_button_also_clears_a_fall_in_naive_mode(seeded, repo, pushes, sfn, monkeypatch):
+    monkeypatch.setattr(orchestrator, "NAIVE_MODE", True)
     await orchestrator.on_watch("amma", "fall")
     out = await orchestrator.on_watch("amma", "im_okay")
     assert out["investigation_closed"] is True
